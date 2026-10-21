@@ -1,0 +1,9 @@
+{
+  "network": "regtest",
+  "state": "data/alice.json",
+  "rpc_config": "btcd.conf",
+  "tier": "ccv",
+  "profile": "dense",
+  "depth": 8,
+  "fee_sat": 20000
+}

@@ -1,0 +1,1742 @@
+diff --git a/blockchain/chain.go b/blockchain/chain.go
+index 952d0bc2..4bd55d78 100644
+--- a/blockchain/chain.go
++++ b/blockchain/chain.go
+@@ -98,6 +98,7 @@ type BlockChain struct {
+ 	checkpointsByHeight map[int32]*chaincfg.Checkpoint
+ 	db                  database.DB
+ 	chainParams         *chaincfg.Params
++	layerTree           bool
+ 	timeSource          MedianTimeSource
+ 	sigCache            *txscript.SigCache
+ 	indexManager        IndexManager
+@@ -2066,6 +2067,9 @@ type IndexManager interface {
+ 
+ // Config is a descriptor which specifies the blockchain instance configuration.
+ type Config struct {
++	// ExperimentalLayerTree enables the MID opcodes on private regtest only.
++	ExperimentalLayerTree bool
++
+ 	// DB defines the database which houses the blocks and will be used to
+ 	// store all metadata created by this package such as the utxo set.
+ 	//
+@@ -2147,6 +2151,10 @@ func New(config *Config) (*BlockChain, error) {
+ 	if config.ChainParams == nil {
+ 		return nil, AssertError("blockchain.New chain parameters nil")
+ 	}
++	if config.ExperimentalLayerTree &&
++		*config.ChainParams.GenesisHash != *chaincfg.RegressionNetParams.GenesisHash {
++		return nil, AssertError("LayerTree requires regtest")
++	}
+ 	if config.TimeSource == nil {
+ 		return nil, AssertError("blockchain.New timesource is nil")
+ 	}
+@@ -2178,6 +2186,7 @@ func New(config *Config) (*BlockChain, error) {
+ 		checkpointsByHeight: checkpointsByHeight,
+ 		db:                  config.DB,
+ 		chainParams:         params,
++		layerTree:           config.ExperimentalLayerTree,
+ 		timeSource:          config.TimeSource,
+ 		sigCache:            config.SigCache,
+ 		indexManager:        config.IndexManager,
+diff --git a/blockchain/layertree.go b/blockchain/layertree.go
+new file mode 100644
+index 00000000..6e159076
+--- /dev/null
++++ b/blockchain/layertree.go
+@@ -0,0 +1,12 @@
++package blockchain
++
++import "github.com/btcsuite/btcd/txscript"
++
++// ExperimentalScriptFlags supplies the same experimental rules to block
++// validation, mining and the mempool. It is immutable after chain creation.
++func (b *BlockChain) ExperimentalScriptFlags() txscript.ScriptFlags {
++	if b.layerTree {
++		return txscript.ScriptVerifyLayerTree
++	}
++	return 0
++}
+diff --git a/blockchain/scriptval.go b/blockchain/scriptval.go
+index 614e030c..576248a4 100644
+--- a/blockchain/scriptval.go
++++ b/blockchain/scriptval.go
+@@ -118,6 +118,22 @@ out:
+ // Validate validates the scripts for all of the passed transaction inputs using
+ // multiple goroutines.
+ func (v *txValidator) Validate(items []*txValidateItem) error {
++	if v.flags&txscript.ScriptVerifyLayerTree != 0 {
++		// CCV amount accounting spans inputs, so validate each experimental
++		// transaction in input order with one fresh context.
++		seen := make(map[*wire.MsgTx]bool)
++		for _, item := range items {
++			tx := item.tx.MsgTx()
++			if seen[tx] {
++				continue
++			}
++			seen[tx] = true
++			if err := txscript.ValidateLayerTreeTransaction(tx, v.utxoView, v.flags, v.sigCache, item.sigHashes); err != nil {
++				return ruleError(ErrScriptValidation, fmt.Sprintf("failed to validate transaction scripts: %v", err))
++			}
++		}
++		return nil
++	}
+ 	if len(items) == 0 {
+ 		return nil
+ 	}
+diff --git a/blockchain/validate.go b/blockchain/validate.go
+index 1cc0ec33..9b158222 100644
+--- a/blockchain/validate.go
++++ b/blockchain/validate.go
+@@ -1321,6 +1321,7 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
+ 	if taprootState == ThresholdActive {
+ 		scriptFlags |= txscript.ScriptVerifyTaproot
+ 	}
++	scriptFlags |= b.ExperimentalScriptFlags()
+ 
+ 	// Now that the inexpensive checks are done and have passed, verify the
+ 	// transactions are actually allowed to spend the coins by running the
+diff --git a/config.go b/config.go
+index cb7ce6b2..6f13b69d 100644
+--- a/config.go
++++ b/config.go
+@@ -98,6 +98,8 @@ func minUint32(a, b uint32) uint32 {
+ //
+ // See loadConfig for details on the configuration load process.
+ type config struct {
++	ExperimentalLayerTree bool `long:"experimental-layertree" description:"Enable experimental LayerTree MID opcodes on private regtest"`
++
+ 	AddCheckpoints       []string      `long:"addcheckpoint" description:"Add a custom checkpoint.  Format: '<height>:<hash>'"`
+ 	AddPeers             []string      `short:"a" long:"addpeer" description:"Add a peer to connect with at startup"`
+ 	AddrIndex            bool          `long:"addrindex" description:"Maintain a full address-based transaction index which makes the searchrawtransactions RPC available"`
+@@ -559,6 +561,11 @@ func loadConfig() (*config, []string, error) {
+ 		numNets++
+ 		activeNetParams = &regressionNetParams
+ 	}
++	if cfg.ExperimentalLayerTree && !cfg.RegressionTest {
++		err := fmt.Errorf("%s: experimental-layertree requires regtest", funcName)
++		fmt.Fprintln(os.Stderr, err)
++		return nil, nil, err
++	}
+ 	if cfg.SimNet {
+ 		numNets++
+ 		// Also disable dns seeding on the simulation test network.
+diff --git a/docs/layertree.md b/docs/layertree.md
+new file mode 100644
+index 00000000..a755fcc5
+--- /dev/null
++++ b/docs/layertree.md
+@@ -0,0 +1,61 @@
++# Experimental LayerTree MID backend
++
++This branch implements the four opcode extensions needed to run LayerTree's
++MID covenant scripts on a private regtest chain. Based on the reference
++implementation at lightninglabs/layertree commit
++`f64cc0e4d4471e32f7fd8294ecb0b1c7547c1166`.
++
++```sh
++go build -o btcd .
++./btcd --regtest --experimental-layertree
++```
++
++Use a new data directory and explicit RPC configuration. The accompanying
++LayerTree `mvp/run.sh` handles those details and exercises the backend.
++
++The flag applies the same rules to mempool validation, block template
++construction and block connection. It is rejected outside regtest. The
++library also guards the network when constructing a blockchain instance.
++Standard Bitcoin behavior is unchanged when the flag is absent.
++
++## Opcodes
++
++* `OP_CAT` at `0x7e`: concatenate two elements, bounded to 520 bytes.
++* `OP_TX` at `0xbf`: selectors `0x8000`, `0x10800`, `0x20800` and `0x4300`.
++  These expose the current input number, current spent amount, current spent
++  scriptPubKey and a selected output's amount and scriptPubKey. Amounts are
++  eight-byte little-endian values. Indexes are Script numbers. Other draft
++  selectors fail closed.
++* `OP_TWEAKADD` at `0xc0`: x-only public key plus a scalar times G. Rejects
++  malformed operands, invalid points, scalar overflow and infinity. Costs
++  50 signature budget units.
++* `OP_CHECKSIGFROMSTACK` at `0xcc`: BIP340 signature verification over a
++  message from the stack. Supports variable-length messages. A nonempty
++  signature costs 50 signature budget units.
++
++These are enabled only in tapscript leaf version `0xc0`. The opcode bytes
++match the LayerTree simulator's placeholders, including its resolutions of
++conflicting draft assignments. This does not implement all `OP_TX` selectors,
++FULL restored arithmetic, CCV or hypothetical native Merkle-sum operations.
++
++The existing 520-byte element, 1,000-element stack, four-byte numeric and
++BIP342 signature budgets remain active. The opcode-success pre-scan recognizes
++the four restored opcodes and executes their semantics. Other upgradeable
++opcodes and leaf versions retain their existing behavior.
++
++## Checks
++
++```sh
++go test ./txscript ./blockchain ./mempool ./mining
++```
++
++`txscript/layertree_test.go` exercises valid and invalid operands, oversized
++concatenation, input and output introspection, scalar and point failures,
++signature failures, budget exhaustion and activation boundaries. The CSV
++fixture is from bitcoin/bips `bip-0340/test-vectors.csv` and includes
++variable-length messages.
++
++The LayerTree checkout's `mvp/test.sh` also executes 104 reference MID cases
++through this interpreter and a real regtest lifecycle. The lifecycle includes
++a direct block submission with an invalid covenant, valid proof of work and
++a valid witness commitment, to verify enforcement beyond mempool policy.
+diff --git a/mempool/mempool.go b/mempool/mempool.go
+index 212a07fa..0291621d 100644
+--- a/mempool/mempool.go
++++ b/mempool/mempool.go
+@@ -63,6 +63,9 @@ type Tag uint64
+ 
+ // Config is a descriptor containing the memory pool configuration.
+ type Config struct {
++	// ExperimentalScriptFlags must agree with the chain's validation rules.
++	ExperimentalScriptFlags txscript.ScriptFlags
++
+ 	// Policy defines the various mempool configuration options related
+ 	// to policy.
+ 	Policy Policy
+@@ -1535,7 +1538,7 @@ func (mp *TxPool) checkMempoolAcceptance(tx *btcutil.Tx,
+ 	// Verify crypto signatures for each input and reject the transaction
+ 	// if any don't verify.
+ 	err = blockchain.ValidateTransactionScripts(tx, utxoView,
+-		txscript.StandardVerifyFlags, mp.cfg.SigCache,
++		txscript.StandardVerifyFlags|mp.cfg.ExperimentalScriptFlags, mp.cfg.SigCache,
+ 		mp.cfg.HashCache)
+ 	if err != nil {
+ 		if cerr, ok := err.(blockchain.RuleError); ok {
+diff --git a/mining/mining.go b/mining/mining.go
+index 5f270652..82a04e47 100644
+--- a/mining/mining.go
++++ b/mining/mining.go
+@@ -745,7 +745,7 @@ mempoolLoop:
+ 			continue
+ 		}
+ 		err = blockchain.ValidateTransactionScripts(tx, blockUtxos,
+-			txscript.StandardVerifyFlags, g.sigCache,
++			txscript.StandardVerifyFlags|g.chain.ExperimentalScriptFlags(), g.sigCache,
+ 			g.hashCache)
+ 		if err != nil {
+ 			log.Tracef("Skipping tx %s due to error in "+
+diff --git a/server.go b/server.go
+index 40755c8e..a6288175 100644
+--- a/server.go
++++ b/server.go
+@@ -2919,6 +2919,8 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
+ 	// Create a new block chain instance with the appropriate configuration.
+ 	var err error
+ 	s.chain, err = blockchain.New(&blockchain.Config{
++		ExperimentalLayerTree: cfg.ExperimentalLayerTree,
++
+ 		DB:               s.db,
+ 		Interrupt:        interrupt,
+ 		ChainParams:      s.chainParams,
+@@ -2965,6 +2967,7 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
+ 	}
+ 
+ 	txC := mempool.Config{
++		ExperimentalScriptFlags: s.chain.ExperimentalScriptFlags(),
+ 		Policy: mempool.Policy{
+ 			DisableRelayPriority: cfg.NoRelayPriority,
+ 			AcceptNonStd:         cfg.RelayNonStd,
+diff --git a/txscript/data/layertree-bip340.csv b/txscript/data/layertree-bip340.csv
+new file mode 100644
+index 00000000..aa317a3b
+--- /dev/null
++++ b/txscript/data/layertree-bip340.csv
+@@ -0,0 +1,20 @@
++index,secret key,public key,aux_rand,message,signature,verification result,comment
++0,0000000000000000000000000000000000000000000000000000000000000003,F9308A019258C31049344F85F89D5229B531C845836F99B08601F113BCE036F9,0000000000000000000000000000000000000000000000000000000000000000,0000000000000000000000000000000000000000000000000000000000000000,E907831F80848D1069A5371B402410364BDF1C5F8307B0084C55F1CE2DCA821525F66A4A85EA8B71E482A74F382D2CE5EBEEE8FDB2172F477DF4900D310536C0,TRUE,
++1,B7E151628AED2A6ABF7158809CF4F3C762E7160F38B4DA56A784D9045190CFEF,DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659,0000000000000000000000000000000000000000000000000000000000000001,243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89,6896BD60EEAE296DB48A229FF71DFE071BDE413E6D43F917DC8DCF8C78DE33418906D11AC976ABCCB20B091292BFF4EA897EFCB639EA871CFA95F6DE339E4B0A,TRUE,
++2,C90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B14E5C9,DD308AFEC5777E13121FA72B9CC1B7CC0139715309B086C960E18FD969774EB8,C87AA53824B4D7AE2EB035A2B5BBBCCC080E76CDC6D1692C4B0B62D798E6D906,7E2D58D8B3BCDF1ABADEC7829054F90DDA9805AAB56C77333024B9D0A508B75C,5831AAEED7B44BB74E5EAB94BA9D4294C49BCF2A60728D8B4C200F50DD313C1BAB745879A5AD954A72C45A91C3A51D3C7ADEA98D82F8481E0E1E03674A6F3FB7,TRUE,
++3,0B432B2677937381AEF05BB02A66ECD012773062CF3FA2549E44F58ED2401710,25D1DFF95105F5253C4022F628A996AD3A0D95FBF21D468A1B33F8C160D8F517,FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF,FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF,7EB0509757E246F19449885651611CB965ECC1A187DD51B64FDA1EDC9637D5EC97582B9CB13DB3933705B32BA982AF5AF25FD78881EBB32771FC5922EFC66EA3,TRUE,test fails if msg is reduced modulo p or n
++4,,D69C3509BB99E412E68B0FE8544E72837DFA30746D8BE2AA65975F29D22DC7B9,,4DF3C3F68FCC83B27E9D42C90431A72499F17875C81A599B566C9889B9696703,00000000000000000000003B78CE563F89A0ED9414F5AA28AD0D96D6795F9C6376AFB1548AF603B3EB45C9F8207DEE1060CB71C04E80F593060B07D28308D7F4,TRUE,
++5,,EEFDEA4CDB677750A420FEE807EACF21EB9898AE79B9768766E4FAA04A2D4A34,,243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89,6CFF5C3BA86C69EA4B7376F31A9BCB4F74C1976089B2D9963DA2E5543E17776969E89B4C5564D00349106B8497785DD7D1D713A8AE82B32FA79D5F7FC407D39B,FALSE,public key not on the curve
++6,,DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659,,243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89,FFF97BD5755EEEA420453A14355235D382F6472F8568A18B2F057A14602975563CC27944640AC607CD107AE10923D9EF7A73C643E166BE5EBEAFA34B1AC553E2,FALSE,has_even_y(R) is false
++7,,DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659,,243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89,1FA62E331EDBC21C394792D2AB1100A7B432B013DF3F6FF4F99FCB33E0E1515F28890B3EDB6E7189B630448B515CE4F8622A954CFE545735AAEA5134FCCDB2BD,FALSE,negated message
++8,,DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659,,243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89,6CFF5C3BA86C69EA4B7376F31A9BCB4F74C1976089B2D9963DA2E5543E177769961764B3AA9B2FFCB6EF947B6887A226E8D7C93E00C5ED0C1834FF0D0C2E6DA6,FALSE,negated s value
++9,,DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659,,243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89,0000000000000000000000000000000000000000000000000000000000000000123DDA8328AF9C23A94C1FEECFD123BA4FB73476F0D594DCB65C6425BD186051,FALSE,sG - eP is infinite. Test fails in single verification if has_even_y(inf) is defined as true and x(inf) as 0
++10,,DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659,,243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89,00000000000000000000000000000000000000000000000000000000000000017615FBAF5AE28864013C099742DEADB4DBA87F11AC6754F93780D5A1837CF197,FALSE,sG - eP is infinite. Test fails in single verification if has_even_y(inf) is defined as true and x(inf) as 1
++11,,DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659,,243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89,4A298DACAE57395A15D0795DDBFD1DCB564DA82B0F269BC70A74F8220429BA1D69E89B4C5564D00349106B8497785DD7D1D713A8AE82B32FA79D5F7FC407D39B,FALSE,sig[0:32] is not an X coordinate on the curve
++12,,DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659,,243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89,FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F69E89B4C5564D00349106B8497785DD7D1D713A8AE82B32FA79D5F7FC407D39B,FALSE,sig[0:32] is equal to field size
++13,,DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659,,243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89,6CFF5C3BA86C69EA4B7376F31A9BCB4F74C1976089B2D9963DA2E5543E177769FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141,FALSE,sig[32:64] is equal to curve order
++14,,FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC30,,243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89,6CFF5C3BA86C69EA4B7376F31A9BCB4F74C1976089B2D9963DA2E5543E17776969E89B4C5564D00349106B8497785DD7D1D713A8AE82B32FA79D5F7FC407D39B,FALSE,public key is not a valid X coordinate because it exceeds the field size
++15,0340034003400340034003400340034003400340034003400340034003400340,778CAA53B4393AC467774D09497A87224BF9FAB6F6E68B23086497324D6FD117,0000000000000000000000000000000000000000000000000000000000000000,,71535DB165ECD9FBBC046E5FFAEA61186BB6AD436732FCCC25291A55895464CF6069CE26BF03466228F19A3A62DB8A649F2D560FAC652827D1AF0574E427AB63,TRUE,message of size 0 (added 2022-12)
++16,0340034003400340034003400340034003400340034003400340034003400340,778CAA53B4393AC467774D09497A87224BF9FAB6F6E68B23086497324D6FD117,0000000000000000000000000000000000000000000000000000000000000000,11,08A20A0AFEF64124649232E0693C583AB1B9934AE63B4C3511F3AE1134C6A303EA3173BFEA6683BD101FA5AA5DBC1996FE7CACFC5A577D33EC14564CEC2BACBF,TRUE,message of size 1 (added 2022-12)
++17,0340034003400340034003400340034003400340034003400340034003400340,778CAA53B4393AC467774D09497A87224BF9FAB6F6E68B23086497324D6FD117,0000000000000000000000000000000000000000000000000000000000000000,0102030405060708090A0B0C0D0E0F1011,5130F39A4059B43BC7CAC09A19ECE52B5D8699D1A71E3C52DA9AFDB6B50AC370C4A482B77BF960F8681540E25B6771ECE1E5A37FD80E5A51897C5566A97EA5A5,TRUE,message of size 17 (added 2022-12)
++18,0340034003400340034003400340034003400340034003400340034003400340,778CAA53B4393AC467774D09497A87224BF9FAB6F6E68B23086497324D6FD117,0000000000000000000000000000000000000000000000000000000000000000,99999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999,403B12B0D8555A344175EA7EC746566303321E5DBFA8BE6F091635163ECA79A8585ED3E3170807E7C03B720FC54C7B23897FCBA0E9D0B4A06894CFD249F22367,TRUE,message of size 100 (added 2022-12)
+diff --git a/txscript/engine.go b/txscript/engine.go
+index 0cc3d96c..0a35c1d2 100644
+--- a/txscript/engine.go
++++ b/txscript/engine.go
+@@ -9,6 +9,7 @@ import (
+ 	"bytes"
+ 	"crypto/sha256"
+ 	"fmt"
++	"github.com/btcsuite/btcd/btcec/v2/schnorr"
+ 	"math/big"
+ 	"strings"
+ 
+@@ -118,6 +119,10 @@ const (
+ 	// ScriptVerifyConstScriptCode fails non-segwit scripts if a signature
+ 	// match is found in the script code or if OP_CODESEPARATOR is used.
+ 	ScriptVerifyConstScriptCode
++
++	// ScriptVerifyLayerTree enables the experimental LayerTree opcode sets. Nodes
++	// may enable this only on a private regression test chain.
++	ScriptVerifyLayerTree
+ )
+ 
+ const (
+@@ -275,20 +280,24 @@ type Engine struct {
+ 	//
+ 	// numOps tracks the total number of non-push operations in a script and is
+ 	// primarily used to enforce maximum limits.
+-	scripts         [][]byte
+-	scriptIdx       int
+-	opcodeIdx       int
+-	lastCodeSep     int
+-	tokenizer       ScriptTokenizer
+-	savedFirstStack [][]byte
+-	dstack          stack
+-	astack          stack
+-	condStack       []int
+-	numOps          int
+-	witnessVersion  int
+-	witnessProgram  []byte
+-	inputAmount     int64
+-	taprootCtx      *taprootExecutionCtx
++	scripts                          [][]byte
++	scriptIdx                        int
++	opcodeIdx                        int
++	lastCodeSep                      int
++	tokenizer                        ScriptTokenizer
++	savedFirstStack                  [][]byte
++	dstack                           stack
++	astack                           stack
++	condStack                        []int
++	numOps                           int
++	witnessVersion                   int
++	witnessProgram                   []byte
++	inputAmount                      int64
++	taprootCtx                       *taprootExecutionCtx
++	layerTreeVersion                 TapscriptLeafVersion
++	layerTreeInternal, layerTreeRoot []byte
++	layerTreeResidual                int64
++	layerTreeContext                 *LayerTreeContext
+ 
+ 	// stepCallback is an optional function that will be called every time
+ 	// a step has been performed during script execution.
+@@ -459,7 +468,7 @@ func checkMinimalDataPush(op *opcode, data []byte) error {
+ // tested in this case.
+ func (vm *Engine) executeOpcode(op *opcode, data []byte) error {
+ 	// Disabled opcodes are fail on program counter.
+-	if isOpcodeDisabled(op.value) {
++	if isOpcodeDisabled(op.value) && !(vm.layerTreeActive() && isLayerTreeOpcodeAt(op.value, vm.layerTreeC2())) {
+ 		str := fmt.Sprintf("attempt to execute disabled opcode %s", op.name)
+ 		return scriptError(ErrDisabledOpcode, str)
+ 	}
+@@ -479,7 +488,7 @@ func (vm *Engine) executeOpcode(op *opcode, data []byte) error {
+ 			return scriptError(ErrTooManyOperations, str)
+ 		}
+ 
+-	} else if len(data) > MaxScriptElementSize {
++	} else if len(data) > vm.layerTreeElementLimit() {
+ 		str := fmt.Sprintf("element size %d exceeds max allowed size %d",
+ 			len(data), MaxScriptElementSize)
+ 		return scriptError(ErrElementTooBig, str)
+@@ -496,11 +505,25 @@ func (vm *Engine) executeOpcode(op *opcode, data []byte) error {
+ 	if vm.dstack.verifyMinimalData && vm.isBranchExecuting() &&
+ 		op.value >= 0 && op.value <= OP_PUSHDATA4 {
+ 
+-		if err := checkMinimalDataPush(op, data); err != nil {
++		// The pinned CCV scripts push the raw BIP443 -1 sentinel.
++		// Permit that encoding under the experimental flag, including C0.
++		// Numeric operands still undergo their ordinary minimality checks.
++		if err := checkMinimalDataPush(op, data); err != nil && !(vm.layerTreeActive() && op.value == 1 && len(data) == 1 && data[0] == 0x81) {
+ 			return err
+ 		}
+ 	}
+ 
++	if vm.layerTreeC2() {
++		if err := vm.layerTreeC2Cost(op.value); err != nil {
++			return err
++		}
++		if isLayerTreeC2Opcode(op.value) {
++			return vm.executeLayerTreeC2(op.value)
++		}
++	}
++	if vm.layerTreeActive() && isLayerTreeOpcode(op.value) {
++		return vm.executeLayerTreeOpcode(op.value)
++	}
+ 	return op.opfunc(op, data, vm)
+ }
+ 
+@@ -698,7 +721,15 @@ func (vm *Engine) verifyWitnessProgram(witness wire.TxWitness) error {
+ 			// check to see if OP_SUCCESS op codes are found in the
+ 			// script. If so, then we'll return here early as we
+ 			// skip proper validation.
+-			if ScriptHasOpSuccess(witnessScript) {
++			vm.layerTreeVersion = controlBlock.LeafVersion
++			vm.layerTreeInternal = schnorr.SerializePubKey(controlBlock.InternalKey)
++			vm.layerTreeRoot = controlBlock.RootHash(witnessScript)
++			vm.layerTreeResidual = vm.inputAmount
++			if vm.layerTreeC2() {
++				vm.taprootCtx.sigOpsBudget = 1 << 30
++			}
++			if scriptHasOpSuccess(witnessScript, vm.hasFlag(ScriptVerifyLayerTree) &&
++				(controlBlock.LeafVersion == BaseLeafVersion || controlBlock.LeafVersion == LayerTreeLeafVersion), controlBlock.LeafVersion) {
+ 				// An op success op code has been found, however if
+ 				// the policy flag forbidding them is active, then
+ 				// we'll return an error.
+@@ -717,7 +748,7 @@ func (vm *Engine) verifyWitnessProgram(witness wire.TxWitness) error {
+ 			// leaf version of the script, as if the policy flag is
+ 			// active, then we should only allow the base leaf
+ 			// version.
+-			if controlBlock.LeafVersion != BaseLeafVersion {
++			if controlBlock.LeafVersion != BaseLeafVersion && !vm.layerTreeC2() {
+ 				switch {
+ 				case vm.hasFlag(ScriptVerifyDiscourageUpgradeableTaprootVersion):
+ 					errStr := fmt.Sprintf("tapscript is attempting "+
+@@ -748,8 +779,8 @@ func (vm *Engine) verifyWitnessProgram(witness wire.TxWitness) error {
+ 			// valid leaf version, we'll save the tapscript hash of
+ 			// the leaf, as we need that for signature validation
+ 			// later.
+-			vm.taprootCtx.tapLeafHash = NewBaseTapLeaf(
+-				witnessScript,
++			vm.taprootCtx.tapLeafHash = NewTapLeaf(
++				controlBlock.LeafVersion, witnessScript,
+ 			).TapHash()
+ 
+ 			// Otherwise, we'll now "recurse" one level deeper, and
+@@ -779,7 +810,7 @@ func (vm *Engine) verifyWitnessProgram(witness wire.TxWitness) error {
+ 	// In addition to the normal script element size limits, taproot also
+ 	// enforces a limit on the max _starting_ stack size.
+ 	case vm.isWitnessVersionActive(TaprootWitnessVersion):
+-		if vm.dstack.Depth() > MaxStackSize {
++		if vm.dstack.Depth() > vm.layerTreeStackLimit() {
+ 			str := fmt.Sprintf("tapscript stack size %d > max allowed %d",
+ 				vm.dstack.Depth(), MaxStackSize)
+ 			return scriptError(ErrStackOverflow, str)
+@@ -791,7 +822,7 @@ func (vm *Engine) verifyWitnessProgram(witness wire.TxWitness) error {
+ 		// than the maximum bytes which are allowed to be pushed onto
+ 		// the stack.
+ 		for _, witElement := range vm.GetStack() {
+-			if len(witElement) > MaxScriptElementSize {
++			if len(witElement) > vm.layerTreeElementLimit() {
+ 				str := fmt.Sprintf("element size %d exceeds "+
+ 					"max allowed size %d", len(witElement),
+ 					MaxScriptElementSize)
+@@ -908,7 +939,15 @@ func (vm *Engine) CheckErrorCondition(finalScript bool) error {
+ 			"stack empty at end of script execution")
+ 	}
+ 
+-	v, err := vm.dstack.PopBool()
++	var v bool
++	var err error
++	if vm.layerTreeC2() {
++		var b []byte
++		b, err = vm.dstack.PopByteArray()
++		v = nonzero(b)
++	} else {
++		v, err = vm.dstack.PopBool()
++	}
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -969,7 +1008,7 @@ func (vm *Engine) Step() (done bool, err error) {
+ 	// The number of elements in the combination of the data and alt stacks
+ 	// must not exceed the maximum number of stack elements allowed.
+ 	combinedStackSize := vm.dstack.Depth() + vm.astack.Depth()
+-	if combinedStackSize > MaxStackSize {
++	if combinedStackSize > vm.layerTreeStackLimit() {
+ 		str := fmt.Sprintf("combined stack size %d > max allowed %d",
+ 			combinedStackSize, MaxStackSize)
+ 		return false, scriptError(ErrStackOverflow, str)
+diff --git a/txscript/layertree.go b/txscript/layertree.go
+new file mode 100644
+index 00000000..90c3c534
+--- /dev/null
++++ b/txscript/layertree.go
+@@ -0,0 +1,223 @@
++package txscript
++
++import (
++	"encoding/binary"
++
++	"github.com/btcsuite/btcd/btcec/v2"
++	"github.com/btcsuite/btcd/btcec/v2/schnorr"
++	"github.com/btcsuite/btcd/chaincfg/chainhash"
++)
++
++// LayerTree uses the author's placeholder assignments for conflicting drafts.
++// These are experimental and do not define Bitcoin consensus assignments.
++const (
++	OP_LAYERTREE_EC_ADD    = 0xbb
++	OP_LAYERTREE_EC_MUL    = 0xbc
++	OP_LAYERTREE_EC_NEGATE = 0xbd
++	OP_LAYERTREE_EC_X      = 0xbe
++	OP_LAYERTREE_CCV       = 0xc1
++	OP_LAYERTREE_TX        = 0xbf
++	OP_LAYERTREE_TWEAKADD  = 0xc0
++	OP_CHECKSIGFROMSTACK   = 0xcc
++)
++
++func isLayerTreeOpcode(op byte) bool {
++	return op == OP_CAT || op == OP_LAYERTREE_TX ||
++		op == OP_LAYERTREE_TWEAKADD || op == OP_CHECKSIGFROMSTACK ||
++		op == OP_LAYERTREE_CCV || (op >= OP_LAYERTREE_EC_ADD && op <= OP_LAYERTREE_EC_X)
++}
++
++func (vm *Engine) layerTreeActive() bool {
++	return vm.taprootCtx != nil && vm.hasFlag(ScriptVerifyLayerTree)
++}
++
++func layerTreeError(msg string) error {
++	return scriptError(ErrInvalidStackOperation, "LayerTree: "+msg)
++}
++
++func (vm *Engine) executeLayerTreeOpcode(op byte) error {
++	switch op {
++	case OP_LAYERTREE_CCV:
++		return vm.layerTreeCCV()
++	case OP_LAYERTREE_EC_ADD, OP_LAYERTREE_EC_MUL, OP_LAYERTREE_EC_NEGATE, OP_LAYERTREE_EC_X:
++		return vm.layerTreeEC(op)
++	case OP_CAT:
++		b, err := vm.dstack.PopByteArray()
++		if err != nil {
++			return err
++		}
++		a, err := vm.dstack.PopByteArray()
++		if err != nil {
++			return err
++		}
++		if len(a)+len(b) > vm.layerTreeElementLimit() {
++			return scriptError(ErrElementTooBig, "OP_CAT exceeds element limit")
++		}
++		joined := make([]byte, 0, len(a)+len(b))
++		vm.dstack.PushByteArray(append(append(joined, a...), b...))
++		return nil
++	case OP_LAYERTREE_TX:
++		return vm.layerTreeTx()
++	case OP_LAYERTREE_TWEAKADD:
++		return vm.layerTreeTweakAdd()
++	case OP_CHECKSIGFROMSTACK:
++		return vm.layerTreeCheckSigFromStack()
++	}
++	return layerTreeError("unknown opcode")
++}
++
++// layerTreeTx implements the four OP_TX selectors used by the MID tree
++// scripts. Other draft selectors fail closed in this MVP.
++func (vm *Engine) layerTreeTx() error {
++	selector, err := vm.layerTreeIndex()
++	if err != nil {
++		return err
++	}
++	amount := func(n int64) []byte {
++		var b [8]byte
++		binary.LittleEndian.PutUint64(b[:], uint64(n))
++		return b[:]
++	}
++	switch selector {
++	case 0x8000: // Current input number, minimal CScriptNum.
++		vm.layerTreePushNumber(int64(vm.txIdx))
++	case 0x10800, 0x20800: // Current input amount or scriptPubKey.
++		if vm.prevOutFetcher == nil {
++			return layerTreeError("missing prevout fetcher")
++		}
++		prev := vm.prevOutFetcher.FetchPrevOutput(vm.tx.TxIn[vm.txIdx].PreviousOutPoint)
++		if prev == nil {
++			return layerTreeError("missing prevout")
++		}
++		if selector == 0x10800 {
++			vm.dstack.PushByteArray(amount(prev.Value))
++		} else {
++			if len(prev.PkScript) > vm.layerTreeElementLimit() {
++				return scriptError(ErrElementTooBig, "OP_TX script exceeds element limit")
++			}
++			vm.dstack.PushByteArray(prev.PkScript)
++		}
++	case 0x4300: // Selected output: amount below scriptPubKey.
++		idx, err := vm.layerTreeIndex()
++		if err != nil {
++			return err
++		}
++		if idx < 0 || int64(idx) >= int64(len(vm.tx.TxOut)) {
++			return layerTreeError("output index out of range")
++		}
++		out := vm.tx.TxOut[int(idx)]
++		if len(out.PkScript) > vm.layerTreeElementLimit() {
++			return scriptError(ErrElementTooBig, "OP_TX script exceeds element limit")
++		}
++		vm.dstack.PushByteArray(amount(out.Value))
++		vm.dstack.PushByteArray(out.PkScript)
++	default:
++		return layerTreeError("unsupported OP_TX selector")
++	}
++	return nil
++}
++
++func (vm *Engine) layerTreeTweakAdd() error {
++	key, err := vm.dstack.PopByteArray()
++	if err != nil {
++		return err
++	}
++	tweak, err := vm.dstack.PopByteArray()
++	if err != nil {
++		return err
++	}
++	if len(key) != 32 || len(tweak) != 32 {
++		return layerTreeError("TWEAKADD needs two 32-byte operands")
++	}
++	if err := vm.taprootCtx.tallysigOp(); err != nil {
++		return err
++	}
++	pub, err := schnorr.ParsePubKey(key)
++	if err != nil {
++		return layerTreeError("TWEAKADD invalid public key")
++	}
++	var scalar btcec.ModNScalar
++	if scalar.SetByteSlice(tweak) {
++		return layerTreeError("TWEAKADD scalar overflow")
++	}
++	var p, t, q btcec.JacobianPoint
++	pub.AsJacobian(&p)
++	btcec.ScalarBaseMultNonConst(&scalar, &t)
++	btcec.AddNonConst(&p, &t, &q)
++	if q.Z.IsZero() {
++		return layerTreeError("TWEAKADD point at infinity")
++	}
++	q.ToAffine()
++	vm.dstack.PushByteArray(schnorr.SerializePubKey(btcec.NewPublicKey(&q.X, &q.Y)))
++	return nil
++}
++
++func (vm *Engine) layerTreeCheckSigFromStack() error {
++	key, err := vm.dstack.PopByteArray()
++	if err != nil {
++		return err
++	}
++	msg, err := vm.dstack.PopByteArray()
++	if err != nil {
++		return err
++	}
++	sig, err := vm.dstack.PopByteArray()
++	if err != nil {
++		return err
++	}
++	if len(key) == 0 {
++		return scriptError(ErrTaprootPubkeyIsEmpty, "CSFS empty public key")
++	}
++	if len(sig) == 0 {
++		vm.dstack.PushBool(false)
++		return nil
++	}
++	if err := vm.taprootCtx.tallysigOp(); err != nil {
++		return err
++	}
++	if len(key) != 32 {
++		if vm.hasFlag(ScriptVerifyDiscourageUpgradeablePubkeyType) {
++			return layerTreeError("CSFS unknown public key type")
++		}
++		vm.dstack.PushBool(true)
++		return nil
++	}
++	pub, err := schnorr.ParsePubKey(key)
++	if err != nil {
++		return layerTreeError("CSFS invalid public key")
++	}
++	if !layerTreeVerifySignature(sig, msg, pub) {
++		return scriptError(ErrNullFail, "CSFS signature failed")
++	}
++	vm.dstack.PushBool(true)
++	return nil
++}
++
++// The pinned btcec verifier only accepts 32-byte messages. BIP348 permits
++// arbitrary messages, so use the BIP340 group equation with the same curve
++// primitives and strict signature parser for CSFS.
++func layerTreeVerifySignature(sig, msg []byte, pub *btcec.PublicKey) bool {
++	if _, err := schnorr.ParseSignature(sig); err != nil {
++		return false
++	}
++	eHash := chainhash.TaggedHash(chainhash.TagBIP0340Challenge,
++		sig[:32], schnorr.SerializePubKey(pub), msg)
++	var e, s btcec.ModNScalar
++	e.SetByteSlice(eHash[:])
++	e.Negate()
++	s.SetByteSlice(sig[32:])
++	var p, sg, ep, r btcec.JacobianPoint
++	pub.AsJacobian(&p)
++	btcec.ScalarBaseMultNonConst(&s, &sg)
++	btcec.ScalarMultNonConst(&e, &p, &ep)
++	btcec.AddNonConst(&sg, &ep, &r)
++	if r.Z.IsZero() {
++		return false
++	}
++	r.ToAffine()
++	var want btcec.FieldVal
++	if want.SetByteSlice(sig[:32]) {
++		return false
++	}
++	return !r.Y.IsOdd() && r.X.Equals(&want)
++}
+diff --git a/txscript/layertree_c2.go b/txscript/layertree_c2.go
+new file mode 100644
+index 00000000..984e07b0
+--- /dev/null
++++ b/txscript/layertree_c2.go
+@@ -0,0 +1,353 @@
++package txscript
++
++import (
++	"math/big"
++
++	"github.com/btcsuite/btcd/btcec/v2"
++)
++
++// This experiment follows the pinned LayerTree reference interpreter. It
++// enables only the restored operations used by the non-channel tiers.
++const LayerTreeLeafVersion TapscriptLeafVersion = 0xc2
++const layerTreeMaxElement = 4_000_000
++
++func (vm *Engine) layerTreeC2() bool {
++	return vm.layerTreeActive() && vm.layerTreeVersion == LayerTreeLeafVersion
++}
++func (vm *Engine) layerTreeElementLimit() int {
++	if vm.layerTreeC2() {
++		return layerTreeMaxElement
++	}
++	return MaxScriptElementSize
++}
++func (vm *Engine) layerTreeStackLimit() int32 {
++	if vm.layerTreeC2() {
++		return 32768
++	}
++	return MaxStackSize
++}
++func isLayerTreeC2Opcode(op byte) bool {
++	switch op {
++	case OP_SUBSTR, OP_LEFT, OP_RIGHT, OP_AND, OP_RSHIFT,
++		OP_ADD, OP_SUB, OP_1ADD, OP_1SUB, OP_NOT, OP_0NOTEQUAL,
++		OP_NUMEQUAL, OP_NUMEQUALVERIFY, OP_LESSTHAN, OP_LESSTHANOREQUAL,
++		OP_GREATERTHANOREQUAL, OP_SIZE, OP_PICK, OP_ROLL, OP_VERIFY,
++		OP_CHECKLOCKTIMEVERIFY:
++		return true
++	}
++	return false
++}
++func isLayerTreeOpcodeAt(op byte, c2 bool) bool {
++	return isLayerTreeOpcode(op) || (c2 && isLayerTreeC2Opcode(op))
++}
++func unsignedLE(b []byte) *big.Int {
++	r := append([]byte(nil), b...)
++	for i, j := 0, len(r)-1; i < j; i, j = i+1, j-1 {
++		r[i], r[j] = r[j], r[i]
++	}
++	return new(big.Int).SetBytes(r)
++}
++func unsignedBytes(n *big.Int) []byte {
++	b := n.Bytes()
++	for i, j := 0, len(b)-1; i < j; i, j = i+1, j-1 {
++		b[i], b[j] = b[j], b[i]
++	}
++	return b
++}
++func (vm *Engine) layerTreePopNumber() (*big.Int, error) {
++	if !vm.layerTreeC2() {
++		n, e := vm.dstack.PopInt()
++		return big.NewInt(int64(n)), e
++	}
++	b, e := vm.dstack.PopByteArray()
++	return unsignedLE(b), e
++}
++func (vm *Engine) layerTreeIndex() (int64, error) {
++	n, e := vm.layerTreePopNumber()
++	if e != nil {
++		return 0, e
++	}
++	if !n.IsInt64() || n.Sign() < 0 {
++		return 0, layerTreeError("index out of range")
++	}
++	return n.Int64(), nil
++}
++func (vm *Engine) layerTreePushNumber(n int64) {
++	if vm.layerTreeC2() {
++		vm.dstack.PushByteArray(unsignedBytes(big.NewInt(n)))
++	} else {
++		vm.dstack.PushInt(scriptNum(n))
++	}
++}
++func (vm *Engine) executeLayerTreeC2(op byte) error {
++	pop := vm.layerTreePopNumber
++	push := func(n *big.Int) error {
++		if n.Sign() < 0 {
++			return layerTreeError("unsigned subtraction underflow")
++		}
++		if (n.BitLen()+7)/8 > layerTreeMaxElement {
++			return layerTreeError("numeric result too large")
++		}
++		vm.dstack.PushByteArray(unsignedBytes(n))
++		return nil
++	}
++	switch op {
++	case OP_ADD, OP_SUB, OP_1ADD, OP_1SUB, OP_NUMEQUAL, OP_NUMEQUALVERIFY, OP_LESSTHAN, OP_LESSTHANOREQUAL, OP_GREATERTHANOREQUAL:
++		b := big.NewInt(1)
++		var err error
++		if op != OP_1ADD && op != OP_1SUB {
++			b, err = pop()
++			if err != nil {
++				return err
++			}
++		}
++		a, err := pop()
++		if err != nil {
++			return err
++		}
++		switch op {
++		case OP_ADD, OP_1ADD:
++			return push(new(big.Int).Add(a, b))
++		case OP_SUB, OP_1SUB:
++			return push(new(big.Int).Sub(a, b))
++		}
++		cmp := a.Cmp(b)
++		ok := cmp == 0
++		switch op {
++		case OP_LESSTHAN:
++			ok = cmp < 0
++		case OP_LESSTHANOREQUAL:
++			ok = cmp <= 0
++		case OP_GREATERTHANOREQUAL:
++			ok = cmp >= 0
++		}
++		if op == OP_NUMEQUALVERIFY {
++			if !ok {
++				return layerTreeError("numeric equality failed")
++			}
++			return nil
++		}
++		vm.dstack.PushBool(ok)
++		return nil
++	case OP_NOT, OP_0NOTEQUAL, OP_VERIFY:
++		a, err := pop()
++		if err != nil {
++			return err
++		}
++		ok := a.Sign() != 0
++		if op == OP_VERIFY {
++			if !ok {
++				return layerTreeError("VERIFY failed")
++			}
++			return nil
++		}
++		if op == OP_NOT {
++			ok = !ok
++		}
++		vm.dstack.PushBool(ok)
++		return nil
++	case OP_SIZE:
++		a, err := vm.dstack.PeekByteArray(0)
++		if err != nil {
++			return err
++		}
++		vm.layerTreePushNumber(int64(len(a)))
++		return nil
++	case OP_PICK, OP_ROLL:
++		n, err := vm.layerTreeIndex()
++		if err != nil {
++			return err
++		}
++		if n >= int64(vm.dstack.Depth()) {
++			return layerTreeError("stack index out of range")
++		}
++		if op == OP_PICK {
++			return vm.dstack.PickN(int32(n))
++		}
++		return vm.dstack.RollN(int32(n))
++	case OP_SUBSTR, OP_LEFT, OP_RIGHT:
++		count, err := pop()
++		if err != nil {
++			return err
++		}
++		begin := big.NewInt(0)
++		if op == OP_SUBSTR {
++			begin, err = pop()
++			if err != nil {
++				return err
++			}
++		}
++		a, err := vm.dstack.PopByteArray()
++		if err != nil {
++			return err
++		}
++		clamp := func(x *big.Int) int {
++			if !x.IsInt64() || x.Int64() > int64(len(a)) {
++				return len(a)
++			}
++			return int(x.Int64())
++		}
++		n := clamp(count)
++		if op == OP_RIGHT {
++			vm.dstack.PushByteArray(a[len(a)-n:])
++			return nil
++		}
++		start := clamp(begin)
++		end := start + n
++		if end > len(a) {
++			end = len(a)
++		}
++		vm.dstack.PushByteArray(a[start:end])
++		return nil
++	case OP_AND:
++		b, err := vm.dstack.PopByteArray()
++		if err != nil {
++			return err
++		}
++		a, err := vm.dstack.PopByteArray()
++		if err != nil {
++			return err
++		}
++		if len(a) < len(b) {
++			a, b = b, a
++		}
++		out := make([]byte, len(a))
++		for i := range b {
++			out[i] = a[i] & b[i]
++		}
++		vm.dstack.PushByteArray(out)
++		return nil
++	case OP_RSHIFT:
++		shift, err := pop()
++		if err != nil {
++			return err
++		}
++		a, err := vm.dstack.PopByteArray()
++		if err != nil {
++			return err
++		}
++		if !shift.IsUint64() || shift.Uint64() >= uint64(len(a))*8 {
++			vm.dstack.PushByteArray(nil)
++			return nil
++		}
++		s := shift.Uint64()
++		n := len(a) - int(s/8)
++		out := make([]byte, n)
++		b := unsignedBytes(new(big.Int).Rsh(unsignedLE(a), uint(s)))
++		copy(out, b)
++		vm.dstack.PushByteArray(out)
++		return nil
++	case OP_CHECKLOCKTIMEVERIFY:
++		a, err := vm.dstack.PeekByteArray(0)
++		if err != nil {
++			return err
++		}
++		n := unsignedLE(a)
++		if !n.IsUint64() || n.Uint64() > 0xffffffff {
++			return layerTreeError("CLTV operand out of range")
++		}
++		v := n.Uint64()
++		if vm.tx.TxIn[vm.txIdx].Sequence == 0xffffffff || (v < LockTimeThreshold) != (vm.tx.LockTime < LockTimeThreshold) || uint64(vm.tx.LockTime) < v {
++			return layerTreeError("CLTV unsatisfied")
++		}
++		return nil
++	}
++	return layerTreeError("unsupported C2 operation")
++}
++
++func (vm *Engine) layerTreeEC(op byte) error {
++	decode := func(b []byte, infinity bool) (*btcec.JacobianPoint, error) {
++		p := new(btcec.JacobianPoint)
++		if len(b) == 0 && infinity {
++			return p, nil
++		}
++		if len(b) != 33 || (b[0] != 2 && b[0] != 3) {
++			return nil, layerTreeError("invalid compressed point")
++		}
++		pk, err := btcec.ParsePubKey(b)
++		if err != nil {
++			return nil, err
++		}
++		pk.AsJacobian(p)
++		return p, nil
++	}
++	push := func(p *btcec.JacobianPoint) {
++		if p.Z.IsZero() {
++			vm.dstack.PushByteArray(nil)
++			return
++		}
++		p.ToAffine()
++		vm.dstack.PushByteArray(btcec.NewPublicKey(&p.X, &p.Y).SerializeCompressed())
++	}
++	b, err := vm.dstack.PopByteArray()
++	if err != nil {
++		return err
++	}
++	switch op {
++	case OP_LAYERTREE_EC_MUL:
++		a, err := vm.dstack.PopByteArray()
++		if err != nil {
++			return err
++		}
++		if len(b) != 32 {
++			return layerTreeError("EC scalar must be 32 bytes")
++		}
++		var k btcec.ModNScalar
++		k.SetByteSlice(b)
++		var out btcec.JacobianPoint
++		if len(a) == 0 {
++			btcec.ScalarBaseMultNonConst(&k, &out)
++		} else {
++			p, err := decode(a, false)
++			if err != nil {
++				return err
++			}
++			btcec.ScalarMultNonConst(&k, p, &out)
++		}
++		push(&out)
++	case OP_LAYERTREE_EC_ADD:
++		a, err := vm.dstack.PopByteArray()
++		if err != nil {
++			return err
++		}
++		p, err := decode(a, true)
++		if err != nil {
++			return err
++		}
++		q, err := decode(b, true)
++		if err != nil {
++			return err
++		}
++		var out btcec.JacobianPoint
++		btcec.AddNonConst(p, q, &out)
++		push(&out)
++	case OP_LAYERTREE_EC_NEGATE:
++		p, err := decode(b, true)
++		if err != nil {
++			return err
++		}
++		if !p.Z.IsZero() {
++			p.ToAffine()
++			p.Y.Negate(1).Normalize()
++		}
++		push(p)
++	case OP_LAYERTREE_EC_X:
++		p, err := decode(b, false)
++		if err != nil {
++			return err
++		}
++		p.ToAffine()
++		x := p.X.Bytes()
++		vm.dstack.PushByteArray(x[:])
++	}
++	return nil
++}
++
++func nonzero(b []byte) bool {
++	for _, v := range b {
++		if v != 0 {
++			return true
++		}
++	}
++	return false
++}
+diff --git a/txscript/layertree_ccv.go b/txscript/layertree_ccv.go
+new file mode 100644
+index 00000000..d3095518
+--- /dev/null
++++ b/txscript/layertree_ccv.go
+@@ -0,0 +1,276 @@
++package txscript
++
++import (
++	"bytes"
++	"crypto/sha256"
++	"encoding/hex"
++	"fmt"
++
++	"github.com/btcsuite/btcd/btcec/v2"
++	"github.com/btcsuite/btcd/btcec/v2/schnorr"
++	"github.com/btcsuite/btcd/chaincfg/chainhash"
++	"github.com/btcsuite/btcd/wire"
++)
++
++// LayerTreeContext belongs to one validation of one transaction. Inputs use
++// it in transaction order. It must not be reused or shared concurrently.
++// The CCV output accumulators are transaction-wide, as required by BIP443.
++type LayerTreeContext struct {
++	minimum            []int64
++	assigned, deducted []bool
++	budget             int64
++}
++
++func NewLayerTreeContext(tx *wire.MsgTx) *LayerTreeContext {
++	n := len(tx.TxOut)
++	return &LayerTreeContext{minimum: make([]int64, n), assigned: make([]bool, n), deducted: make([]bool, n), budget: int64(tx.SerializeSizeStripped()*3+tx.SerializeSize()) * 10000}
++}
++func (vm *Engine) SetLayerTreeContext(c *LayerTreeContext) { vm.layerTreeContext = c }
++func (vm *Engine) layerTreeCharge(cost int64) error {
++	if vm.layerTreeContext == nil {
++		vm.layerTreeContext = NewLayerTreeContext(&vm.tx)
++	}
++	if cost < 0 || cost > vm.layerTreeContext.budget {
++		return layerTreeError("execution budget exhausted")
++	}
++	vm.layerTreeContext.budget -= cost
++	return nil
++}
++
++// ValidateLayerTreeTransaction applies the experimental rules to all inputs
++// with one CCV accounting context. Ordinary transaction and UTXO checks are
++// still the responsibility of the caller.
++func ValidateLayerTreeTransaction(tx *wire.MsgTx, fetch PrevOutputFetcher,
++	flags ScriptFlags, cache *SigCache, hashes *TxSigHashes) error {
++	if tx == nil || fetch == nil {
++		return layerTreeError("missing transaction or prevout fetcher")
++	}
++	// Validate availability before sighash caching, which assumes every
++	// previous output is present.
++	for _, in := range tx.TxIn {
++		if in == nil || fetch.FetchPrevOutput(in.PreviousOutPoint) == nil {
++			return layerTreeError("missing transaction prevout")
++		}
++	}
++	ctx := NewLayerTreeContext(tx)
++	if hashes == nil {
++		hashes = NewTxSigHashes(tx, fetch)
++	}
++	for i, in := range tx.TxIn {
++		prev := fetch.FetchPrevOutput(in.PreviousOutPoint)
++		if prev == nil {
++			return layerTreeError("missing transaction prevout")
++		}
++		vm, err := NewEngine(prev.PkScript, tx, i, flags, cache, hashes, prev.Value, fetch)
++		if err != nil {
++			return err
++		}
++		vm.SetLayerTreeContext(ctx)
++		if err = vm.Execute(); err != nil {
++			return fmt.Errorf("input %d: %w", i, err)
++		}
++	}
++	return nil
++}
++
++func (vm *Engine) layerTreeCCV() error {
++	if err := vm.layerTreeCharge(500000); err != nil {
++		return err
++	}
++	if !vm.layerTreeC2() {
++		if err := vm.taprootCtx.tallysigOp(); err != nil {
++			return err
++		}
++	}
++	args := make([][]byte, 5)
++	for i := range args {
++		b, err := vm.dstack.PopByteArray()
++		if err != nil {
++			return err
++		}
++		args[i] = b
++	}
++	mode, tt, pk, index, data := args[0], args[1], args[2], args[3], args[4]
++	m, err := MakeScriptNum(mode, true, 4)
++	if err != nil {
++		return err
++	}
++	if m < -1 || m > 2 {
++		if vm.hasFlag(ScriptVerifyDiscourageOpSuccess) {
++			return layerTreeError("unknown CCV mode")
++		}
++		vm.taprootCtx.mustSucceed = true
++		vm.scriptIdx = len(vm.scripts) - 1
++		vm.tokenizer = MakeScriptTokenizer(0, nil)
++		return nil
++	}
++	idx := int64(vm.txIdx)
++	if !bytes.Equal(index, []byte{0x81}) {
++		n, err := MakeScriptNum(index, true, 4)
++		if err != nil {
++			return err
++		}
++		idx = int64(n)
++		if idx < 0 {
++			return layerTreeError("negative CCV index")
++		}
++	}
++	switch {
++	case bytes.Equal(tt, []byte{0x81}):
++		tt = vm.layerTreeRoot
++	case len(tt) == 0 || len(tt) == 32:
++	default:
++		return layerTreeError("invalid CCV taptree")
++	}
++	switch {
++	case len(pk) == 0:
++		pk, _ = hex.DecodeString("50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0")
++	case bytes.Equal(pk, []byte{0x81}):
++		pk = vm.layerTreeInternal
++	case len(pk) == 32:
++	default:
++		return layerTreeError("invalid CCV key")
++	}
++	tweakKey := func(key, tw []byte) ([]byte, error) {
++		p, err := schnorr.ParsePubKey(key)
++		if err != nil {
++			return nil, err
++		}
++		var k btcec.ModNScalar
++		if k.SetByteSlice(tw) {
++			return nil, layerTreeError("CCV tweak overflow")
++		}
++		var pj, t, q btcec.JacobianPoint
++		p.AsJacobian(&pj)
++		btcec.ScalarBaseMultNonConst(&k, &t)
++		btcec.AddNonConst(&pj, &t, &q)
++		if q.Z.IsZero() {
++			return nil, layerTreeError("CCV infinity")
++		}
++		q.ToAffine()
++		return schnorr.SerializePubKey(btcec.NewPublicKey(&q.X, &q.Y)), nil
++	}
++	if _, err := schnorr.ParsePubKey(pk); err != nil {
++		return err
++	}
++	if len(data) != 0 {
++		h := sha256.New()
++		h.Write(pk)
++		h.Write(data)
++		pk, err = tweakKey(pk, h.Sum(nil))
++		if err != nil {
++			return err
++		}
++	}
++	if len(tt) != 0 {
++		tw := chainhash.TaggedHash(chainhash.TagTapTweak, pk, tt)
++		pk, err = tweakKey(pk, tw[:])
++		if err != nil {
++			return err
++		}
++	}
++	expected := append([]byte{OP_1, 32}, pk...)
++	var target []byte
++	if m == -1 {
++		if vm.prevOutFetcher == nil {
++			return layerTreeError("missing CCV prevout fetcher")
++		}
++		if idx >= int64(len(vm.tx.TxIn)) {
++			return layerTreeError("CCV input index out of range")
++		}
++		prev := vm.prevOutFetcher.FetchPrevOutput(vm.tx.TxIn[idx].PreviousOutPoint)
++		if prev == nil {
++			return layerTreeError("missing CCV input")
++		}
++		target = prev.PkScript
++	} else {
++		if idx >= int64(len(vm.tx.TxOut)) {
++			return layerTreeError("CCV output index out of range")
++		}
++		out := vm.tx.TxOut[idx]
++		target = out.PkScript
++		c := vm.layerTreeContext
++		switch m {
++		case 0:
++			if c.deducted[idx] {
++				return layerTreeError("CCV assignment after deduction")
++			}
++			if vm.layerTreeResidual < 0 || c.minimum[idx] > int64(^uint64(0)>>1)-vm.layerTreeResidual {
++				return layerTreeError("CCV amount overflow")
++			}
++			c.minimum[idx] += vm.layerTreeResidual
++			vm.layerTreeResidual = 0
++			if out.Value < c.minimum[idx] {
++				return layerTreeError("CCV output below assigned amount")
++			}
++			c.assigned[idx] = true
++		case 2:
++			if out.Value < 0 || vm.layerTreeResidual < out.Value {
++				return layerTreeError("CCV deduction exceeds residual")
++			}
++			if c.assigned[idx] || c.deducted[idx] {
++				return layerTreeError("CCV duplicate deduction")
++			}
++			vm.layerTreeResidual -= out.Value
++			c.deducted[idx] = true
++		}
++	}
++	if !bytes.Equal(target, expected) {
++		return layerTreeError("CCV scriptPubKey mismatch")
++	}
++	return nil
++}
++
++// This conservative work budget bounds the operations used by LayerTree.
++// It is not the exact BIP440 schedule or a complete implementation of BIP441.
++func (vm *Engine) layerTreeC2Cost(op byte) error {
++	n := func(i int32) int64 { b, _ := vm.dstack.PeekByteArray(i); return int64(len(b)) }
++	span := func(n int64) int64 { return (n + 7) / 8 * 8 }
++	a, b := n(0), n(1)
++	cost := int64(0)
++	switch op {
++	case OP_CAT:
++		cost = 3 * (a + b)
++	case OP_DUP, OP_TUCK:
++		cost = 3 * a
++	case OP_OVER:
++		cost = 3 * b
++	case OP_2DUP:
++		cost = 3 * (a + b)
++	case OP_SHA256:
++		cost = 50 * a
++	case OP_EQUAL, OP_EQUALVERIFY:
++		if a == b {
++			cost = 2 * a
++		}
++	case OP_ADD, OP_SUB, OP_1ADD, OP_1SUB:
++		cost = 9 * (span(a) + span(b))
++	case OP_NUMEQUAL, OP_NUMEQUALVERIFY, OP_LESSTHAN, OP_LESSTHANOREQUAL, OP_GREATERTHANOREQUAL, OP_AND:
++		cost = 2 * (span(a) + span(b))
++	case OP_NOT, OP_0NOTEQUAL, OP_VERIFY, OP_CHECKLOCKTIMEVERIFY:
++		cost = 2 * span(a)
++	case OP_LEFT, OP_RIGHT, OP_SUBSTR, OP_RSHIFT:
++		cost = 3*(a+b+n(2)) + 32
++	case OP_PICK, OP_ROLL:
++		cost = 48*int64(vm.dstack.Depth()) + 3*b
++	case OP_CHECKSIG, OP_CHECKSIGVERIFY:
++		if b != 0 {
++			cost = 500000
++		}
++	case OP_CHECKSIGFROMSTACK:
++		if n(2) != 0 {
++			cost = 500000
++		}
++	case OP_LAYERTREE_TWEAKADD:
++		cost = 500000
++	case OP_LAYERTREE_EC_ADD:
++		cost = 100000
++	case OP_LAYERTREE_EC_MUL:
++		cost = 300000
++	case OP_LAYERTREE_EC_NEGATE:
++		cost = 50000
++	case OP_LAYERTREE_EC_X:
++		cost = 10000
++	}
++	return vm.layerTreeCharge(cost)
++}
+diff --git a/txscript/layertree_modes_test.go b/txscript/layertree_modes_test.go
+new file mode 100644
+index 00000000..f39ec50a
+--- /dev/null
++++ b/txscript/layertree_modes_test.go
+@@ -0,0 +1,164 @@
++package txscript
++
++import (
++	"bytes"
++	"testing"
++
++	"github.com/btcsuite/btcd/btcec/v2"
++	"github.com/btcsuite/btcd/btcec/v2/schnorr"
++	"github.com/btcsuite/btcd/wire"
++)
++
++func TestLayerTreeC2Rules(t *testing.T) {
++	flags := StandardVerifyFlags | ScriptVerifyLayerTree
++	tests := []struct {
++		name   string
++		script []byte
++		stack  [][]byte
++		fail   bool
++	}{
++		{"unsigned high bit", []byte{OP_1ADD, 2, 0, 1, OP_EQUAL}, [][]byte{{0xff}}, false},
++		{"large arithmetic", []byte{OP_ADD, 9, 0, 0, 0, 0, 0, 0, 0, 0, 2, OP_EQUAL}, [][]byte{{0, 0, 0, 0, 0, 0, 0, 0, 1}, {0, 0, 0, 0, 0, 0, 0, 0, 1}}, false},
++		{"underflow", []byte{OP_SUB, OP_DROP, OP_TRUE}, [][]byte{{1}, {2}}, true},
++		{"right zero", []byte{OP_0, OP_RIGHT, OP_0, OP_EQUAL}, [][]byte{[]byte("abc")}, false},
++		{"right oversize", []byte{OP_5, OP_RIGHT, 3, 'a', 'b', 'c', OP_EQUAL}, [][]byte{[]byte("abc")}, false},
++		{"slice beyond end", []byte{OP_5, OP_2, OP_SUBSTR, OP_0, OP_EQUAL}, [][]byte{[]byte("abc")}, false},
++		{"unsigned truth", []byte{}, [][]byte{{0x80}}, false},
++		{"bad numeric equality", []byte{OP_NUMEQUALVERIFY, OP_TRUE}, [][]byte{{0xff}, {0xff, 0}}, false},
++		{"large element", []byte{OP_CAT, OP_SIZE, 2, 0x58, 2, OP_NUMEQUALVERIFY, OP_DROP, OP_TRUE}, [][]byte{bytes.Repeat([]byte{1}, 300), bytes.Repeat([]byte{2}, 300)}, false},
++		{"stack underflow", []byte{OP_DROP, OP_TRUE}, nil, true},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			script := tt.script
++			if len(script) == 0 {
++				script = []byte{OP_DUP, OP_DROP}
++			}
++			err := runLayerTreeScript(script, tt.stack, flags, LayerTreeLeafVersion)
++			if (err != nil) != tt.fail {
++				t.Fatalf("got %v, expected failure %v", err, tt.fail)
++			}
++		})
++	}
++	if err := runLayerTreeScript([]byte{OP_CAT, OP_DROP, OP_TRUE}, [][]byte{bytes.Repeat([]byte{1}, 300), bytes.Repeat([]byte{2}, 300)}, flags, BaseLeafVersion); err == nil {
++		t.Fatal("C0 lost 520 byte bound")
++	}
++	var stack [][]byte
++	script := make([]byte, 0, 1102)
++	for i := 0; i < 1100; i++ {
++		stack = append(stack, nil)
++		script = append(script, OP_DROP)
++	}
++	script = append(script, OP_TRUE)
++	if err := runLayerTreeScript(script, stack, flags, LayerTreeLeafVersion); err != nil {
++		t.Fatal(err)
++	}
++	if err := runLayerTreeScript(script, stack, flags, BaseLeafVersion); err == nil {
++		t.Fatal("C0 lost stack bound")
++	}
++	// A future tapleaf succeeds before activation but executes after it.
++	old := ScriptVerifyWitness | ScriptVerifyTaproot | ScriptBip16
++	if err := runLayerTreeScript([]byte{OP_FALSE}, nil, old, LayerTreeLeafVersion); err != nil {
++		t.Fatal(err)
++	}
++	if err := runLayerTreeScript([]byte{OP_FALSE}, nil, old|ScriptVerifyLayerTree, LayerTreeLeafVersion); err == nil {
++		t.Fatal("C2 bypassed validation")
++	}
++}
++
++func TestLayerTreeCCVTransactionAccounting(t *testing.T) {
++	_, pub := btcec.PrivKeyFromBytes([]byte{7})
++	x := schnorr.SerializePubKey(pub)
++	for _, version := range []TapscriptLeafVersion{BaseLeafVersion, LayerTreeLeafVersion} {
++		for _, amount := range []int64{1000, 1400} {
++			// Two inputs each assign 700 sats to the same output.
++			script := append([]byte{OP_0, OP_0, 32}, x...)
++			script = append(script, OP_0, OP_0, OP_LAYERTREE_CCV, OP_TRUE)
++			leaf := NewTapLeaf(version, script)
++			root := leaf.TapHash()
++			key := ComputeTaprootOutputKey(pub, root[:])
++			pk, _ := PayToTaprootScript(key)
++			cb := ControlBlock{InternalKey: pub, OutputKeyYIsOdd: key.SerializeCompressed()[0] == 3, LeafVersion: version}
++			control, err := cb.ToBytes()
++			if err != nil {
++				t.Fatal(err)
++			}
++			tx := wire.NewMsgTx(2)
++			prevs := make(map[wire.OutPoint]*wire.TxOut)
++			for i := uint32(0); i < 2; i++ {
++				op := wire.OutPoint{Index: i}
++				tx.AddTxIn(&wire.TxIn{PreviousOutPoint: op, Witness: wire.TxWitness{script, control}})
++				prevs[op] = wire.NewTxOut(700, pk)
++			}
++			tx.AddTxOut(wire.NewTxOut(amount, append([]byte{OP_1, 32}, x...)))
++			err = ValidateLayerTreeTransaction(tx, NewMultiPrevOutFetcher(prevs), StandardVerifyFlags|ScriptVerifyLayerTree, nil, nil)
++			if amount == 1000 && err == nil {
++				t.Fatal("CCV amounts were not accumulated across inputs")
++			}
++			if amount == 1400 && err != nil {
++				t.Fatal(err)
++			}
++			// DEDUCT may touch each output only once, even across inputs.
++			script[len(script)-3] = OP_2
++			leaf = NewTapLeaf(version, script)
++			root = leaf.TapHash()
++			key = ComputeTaprootOutputKey(pub, root[:])
++			pk, _ = PayToTaprootScript(key)
++			cb.OutputKeyYIsOdd = key.SerializeCompressed()[0] == 3
++			control, _ = cb.ToBytes()
++			tx.TxOut[0].Value = 500
++			for _, in := range tx.TxIn {
++				in.Witness = wire.TxWitness{script, control}
++				prevs[in.PreviousOutPoint] = wire.NewTxOut(700, pk)
++			}
++			if err = ValidateLayerTreeTransaction(tx, NewMultiPrevOutFetcher(prevs), StandardVerifyFlags|ScriptVerifyLayerTree, nil, nil); err == nil {
++				t.Fatal("CCV duplicate deduction accepted")
++			}
++		}
++	}
++}
++func TestLayerTreeECOperations(t *testing.T) {
++	_, g := btcec.PrivKeyFromBytes([]byte{1})
++	_, twoG := btcec.PrivKeyFromBytes([]byte{2})
++	scalar := make([]byte, 32)
++	scalar[31] = 2
++	tests := []struct {
++		op    byte
++		stack [][]byte
++		want  []byte
++		fail  bool
++	}{
++		{OP_LAYERTREE_EC_MUL, [][]byte{nil, scalar}, twoG.SerializeCompressed(), false},
++		{OP_LAYERTREE_EC_ADD, [][]byte{g.SerializeCompressed(), g.SerializeCompressed()}, twoG.SerializeCompressed(), false},
++		{OP_LAYERTREE_EC_X, [][]byte{g.SerializeCompressed()}, schnorr.SerializePubKey(g), false},
++		{OP_LAYERTREE_EC_X, [][]byte{nil}, nil, true},
++		{OP_LAYERTREE_EC_MUL, [][]byte{nil, {1}}, nil, true},
++		{OP_LAYERTREE_EC_ADD, [][]byte{g.SerializeCompressed(), {1}}, nil, true},
++	}
++	for _, tt := range tests {
++		vm := &Engine{}
++		vm.SetStack(tt.stack)
++		err := vm.layerTreeEC(tt.op)
++		if (err != nil) != tt.fail {
++			t.Fatalf("op %x: %v", tt.op, err)
++		}
++		if err == nil {
++			b, e := vm.dstack.PopByteArray()
++			if e != nil || !bytes.Equal(b, tt.want) {
++				t.Fatalf("op %x result %x", tt.op, b)
++			}
++		}
++	}
++}
++
++func TestLayerTreeTransactionMissingPrevout(t *testing.T) {
++	tx := wire.NewMsgTx(2)
++	tx.AddTxIn(&wire.TxIn{})
++	tx.AddTxOut(wire.NewTxOut(1, []byte{OP_TRUE}))
++	if err := ValidateLayerTreeTransaction(tx, NewMultiPrevOutFetcher(nil), StandardVerifyFlags|ScriptVerifyLayerTree, nil, nil); err == nil {
++		t.Fatal("missing prevout accepted")
++	}
++	if err := ValidateLayerTreeTransaction(tx, nil, StandardVerifyFlags|ScriptVerifyLayerTree, nil, nil); err == nil {
++		t.Fatal("missing fetcher accepted")
++	}
++}
+diff --git a/txscript/layertree_test.go b/txscript/layertree_test.go
+new file mode 100644
+index 00000000..53632759
+--- /dev/null
++++ b/txscript/layertree_test.go
+@@ -0,0 +1,209 @@
++package txscript
++
++import (
++	"bytes"
++	"crypto/sha256"
++	"encoding/csv"
++	"encoding/hex"
++	"os"
++	"testing"
++
++	"github.com/btcsuite/btcd/btcec/v2"
++	"github.com/btcsuite/btcd/btcec/v2/schnorr"
++	"github.com/btcsuite/btcd/wire"
++)
++
++func TestLayerTreeOpcodes(t *testing.T) {
++	priv, pub := btcec.PrivKeyFromBytes([]byte{1})
++	key := schnorr.SerializePubKey(pub)
++	msg := sha256.Sum256([]byte("voucher"))
++	sig, err := schnorr.Sign(priv, msg[:])
++	if err != nil {
++		t.Fatal(err)
++	}
++	badMsg := sha256.Sum256([]byte("different voucher"))
++	order, _ := hex.DecodeString("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141")
++	minusOne, _ := hex.DecodeString("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364140")
++	one := make([]byte, 32)
++	one[31] = 1
++	_, two := btcec.PrivKeyFromBytes([]byte{2})
++	cases := []struct {
++		name  string
++		op    byte
++		stack [][]byte
++		want  [][]byte
++		fail  bool
++	}{
++		{"cat", OP_CAT, [][]byte{[]byte("ab"), []byte("cd")}, [][]byte{[]byte("abcd")}, false},
++		{"cat empty", OP_CAT, [][]byte{nil, nil}, [][]byte{nil}, false},
++		{"cat limit", OP_CAT, [][]byte{make([]byte, 260), make([]byte, 260)}, [][]byte{make([]byte, 520)}, false},
++		{"cat oversized", OP_CAT, [][]byte{make([]byte, 520), {1}}, nil, true},
++		{"cat underflow", OP_CAT, [][]byte{{1}}, nil, true},
++		{"tweak zero", OP_LAYERTREE_TWEAKADD, [][]byte{make([]byte, 32), key}, [][]byte{key}, false},
++		{"tweak one", OP_LAYERTREE_TWEAKADD, [][]byte{one, key}, [][]byte{schnorr.SerializePubKey(two)}, false},
++		{"tweak order", OP_LAYERTREE_TWEAKADD, [][]byte{order, key}, nil, true},
++		{"tweak infinity", OP_LAYERTREE_TWEAKADD, [][]byte{minusOne, key}, nil, true},
++		{"tweak bad key", OP_LAYERTREE_TWEAKADD, [][]byte{one, bytes.Repeat([]byte{255}, 32)}, nil, true},
++		{"tweak short", OP_LAYERTREE_TWEAKADD, [][]byte{{1}, key}, nil, true},
++		{"tweak underflow", OP_LAYERTREE_TWEAKADD, nil, nil, true},
++		{"csfs", OP_CHECKSIGFROMSTACK, [][]byte{sig.Serialize(), msg[:], key}, [][]byte{{1}}, false},
++		{"csfs wrong message", OP_CHECKSIGFROMSTACK, [][]byte{sig.Serialize(), badMsg[:], key}, nil, true},
++		{"csfs empty sig", OP_CHECKSIGFROMSTACK, [][]byte{nil, msg[:], key}, [][]byte{nil}, false},
++		{"csfs empty key", OP_CHECKSIGFROMSTACK, [][]byte{nil, msg[:], nil}, nil, true},
++		{"csfs malformed", OP_CHECKSIGFROMSTACK, [][]byte{{1}, msg[:], key}, nil, true},
++		{"csfs underflow", OP_CHECKSIGFROMSTACK, [][]byte{key}, nil, true},
++		{"tx input index", OP_LAYERTREE_TX, [][]byte{scriptNum(0x8000).Bytes()}, [][]byte{nil}, false},
++		{"tx input amount", OP_LAYERTREE_TX, [][]byte{scriptNum(0x10800).Bytes()}, [][]byte{{42, 0, 0, 0, 0, 0, 0, 0}}, false},
++		{"tx input script", OP_LAYERTREE_TX, [][]byte{scriptNum(0x20800).Bytes()}, [][]byte{{OP_TRUE}}, false},
++		{"tx output", OP_LAYERTREE_TX, [][]byte{nil, scriptNum(0x4300).Bytes()}, [][]byte{{41, 0, 0, 0, 0, 0, 0, 0}, {OP_TRUE}}, false},
++		{"tx negative index", OP_LAYERTREE_TX, [][]byte{scriptNum(-1).Bytes(), scriptNum(0x4300).Bytes()}, nil, true},
++		{"tx index past end", OP_LAYERTREE_TX, [][]byte{{1}, scriptNum(0x4300).Bytes()}, nil, true},
++		{"tx unknown selector", OP_LAYERTREE_TX, [][]byte{scriptNum(0x100000).Bytes()}, nil, true},
++		{"tx negative selector", OP_LAYERTREE_TX, [][]byte{scriptNum(-1).Bytes()}, nil, true},
++		{"tx nonminimal selector", OP_LAYERTREE_TX, [][]byte{{0, 128, 0, 0}}, nil, true},
++		{"tx underflow", OP_LAYERTREE_TX, nil, nil, true},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			vm := &Engine{flags: ScriptVerifyLayerTree, taprootCtx: &taprootExecutionCtx{sigOpsBudget: 1000}, prevOutFetcher: NewCannedPrevOutputFetcher([]byte{OP_TRUE}, 42)}
++			vm.tx = *wire.NewMsgTx(2)
++			vm.tx.AddTxIn(&wire.TxIn{})
++			vm.tx.AddTxOut(wire.NewTxOut(41, []byte{OP_TRUE}))
++			vm.dstack.verifyMinimalData = true
++			for _, b := range c.stack {
++				vm.dstack.PushByteArray(b)
++			}
++			err := vm.executeLayerTreeOpcode(c.op)
++			if c.fail {
++				if err == nil {
++					t.Fatal("invalid operation accepted")
++				}
++				return
++			}
++			if err != nil {
++				t.Fatal(err)
++			}
++			got := vm.GetStack()
++			if len(got) != len(c.want) {
++				t.Fatalf("stack size %d want %d", len(got), len(c.want))
++			}
++			for i := range got {
++				if !bytes.Equal(got[i], c.want[i]) {
++					t.Fatalf("stack[%d]=%x want %x", i, got[i], c.want[i])
++				}
++			}
++		})
++	}
++	for _, op := range []byte{OP_LAYERTREE_TWEAKADD, OP_CHECKSIGFROMSTACK} {
++		t.Run("budget", func(t *testing.T) {
++			vm := &Engine{taprootCtx: &taprootExecutionCtx{sigOpsBudget: 49}}
++			if op == OP_CHECKSIGFROMSTACK {
++				vm.dstack.PushByteArray(sig.Serialize())
++				vm.dstack.PushByteArray(msg[:])
++				vm.dstack.PushByteArray(key)
++			} else {
++				vm.dstack.PushByteArray(one)
++				vm.dstack.PushByteArray(key)
++			}
++			if err := vm.executeLayerTreeOpcode(op); err == nil {
++				t.Fatal("budget exhaustion accepted")
++			}
++		})
++	}
++}
++
++// Exercise the full Taproot path. Redefined opcodes must not cause the
++// OP_SUCCESS shortcut, including when hidden in an unexecuted branch.
++func TestLayerTreeActivation(t *testing.T) {
++	scripts := [][]byte{
++		{OP_CAT, OP_FALSE},
++		{OP_FALSE, OP_IF, OP_CAT, OP_ENDIF, OP_FALSE},
++		{OP_FALSE, OP_IF, OP_LAYERTREE_TX, OP_ENDIF, OP_FALSE},
++		{OP_FALSE, OP_IF, OP_LAYERTREE_TWEAKADD, OP_ENDIF, OP_FALSE},
++		{OP_FALSE, OP_IF, OP_CHECKSIGFROMSTACK, OP_ENDIF, OP_FALSE},
++	}
++	for _, script := range scripts {
++		if err := runLayerTreeScript(script, nil, ScriptVerifyWitness|ScriptVerifyTaproot|ScriptBip16, BaseLeafVersion); err != nil {
++			t.Fatalf("preactivation OP_SUCCESS: %v", err)
++		}
++		if err := runLayerTreeScript(script, nil, StandardVerifyFlags|ScriptVerifyLayerTree, BaseLeafVersion); err == nil {
++			t.Fatal("experimental invalid script accepted")
++		}
++	}
++	script := []byte{OP_CAT, 2, 'a', 'b', OP_EQUAL}
++	if err := runLayerTreeScript(script, [][]byte{[]byte("a"), []byte("b")}, StandardVerifyFlags|ScriptVerifyLayerTree, BaseLeafVersion); err != nil {
++		t.Fatal(err)
++	}
++	if err := runLayerTreeScript(script, [][]byte{[]byte("a"), []byte("b")}, StandardVerifyFlags, BaseLeafVersion); err == nil {
++		t.Fatal("policy accepted unactivated opcode")
++	}
++	// Unknown leaf versions retain the existing consensus behavior.
++	if err := runLayerTreeScript([]byte{OP_CAT, OP_FALSE}, nil, ScriptVerifyWitness|ScriptVerifyTaproot|ScriptBip16|ScriptVerifyLayerTree, 0xc4); err != nil {
++		t.Fatal(err)
++	}
++	// Legacy and segwit v0 cannot use the restored opcode.
++	tx := wire.NewMsgTx(2)
++	tx.AddTxIn(&wire.TxIn{})
++	vm, err := NewEngine([]byte{OP_0, OP_0, OP_CAT, OP_TRUE}, tx, 0, ScriptVerifyLayerTree, nil, nil, 0, nil)
++	if err == nil {
++		err = vm.Execute()
++	}
++	if err == nil {
++		t.Fatal("legacy CAT enabled")
++	}
++}
++
++func runLayerTreeScript(script []byte, stack [][]byte, flags ScriptFlags, version TapscriptLeafVersion) error {
++	_, key := btcec.PrivKeyFromBytes([]byte{1})
++	leaf := NewTapLeaf(version, script)
++	root := leaf.TapHash()
++	out := ComputeTaprootOutputKey(key, root[:])
++	pk, _ := PayToTaprootScript(out)
++	cb := ControlBlock{InternalKey: key, OutputKeyYIsOdd: out.SerializeCompressed()[0] == 3, LeafVersion: version}
++	control, err := cb.ToBytes()
++	if err != nil {
++		return err
++	}
++	tx := wire.NewMsgTx(2)
++	tx.AddTxIn(&wire.TxIn{Witness: append(append(wire.TxWitness{}, stack...), script, control)})
++	tx.AddTxOut(wire.NewTxOut(1, []byte{OP_TRUE}))
++	fetch := NewCannedPrevOutputFetcher(pk, 2)
++	vm, err := NewEngine(pk, tx, 0, flags, nil, NewTxSigHashes(tx, fetch), 2, fetch)
++	if err != nil {
++		return err
++	}
++	return vm.Execute()
++}
++
++// Official BIP340 vectors include empty, one-byte, 17-byte and 100-byte
++// messages as well as invalid points, parity and scalar encodings.
++func TestLayerTreeBIP340Vectors(t *testing.T) {
++	f, err := os.Open("data/layertree-bip340.csv")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer f.Close()
++	rows, err := csv.NewReader(f).ReadAll()
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, row := range rows[1:] {
++		t.Run(row[0], func(t *testing.T) {
++			decode := func(s string) []byte {
++				b, err := hex.DecodeString(s)
++				if err != nil {
++					t.Fatal(err)
++				}
++				return b
++			}
++			vm := &Engine{taprootCtx: &taprootExecutionCtx{sigOpsBudget: 50}}
++			vm.dstack.PushByteArray(decode(row[5]))
++			vm.dstack.PushByteArray(decode(row[4]))
++			vm.dstack.PushByteArray(decode(row[2]))
++			err := vm.executeLayerTreeOpcode(OP_CHECKSIGFROMSTACK)
++			if (err == nil) != (row[6] == "TRUE") {
++				t.Fatalf("result %v, expected %s: %s", err, row[6], row[7])
++			}
++		})
++	}
++}
+diff --git a/txscript/script.go b/txscript/script.go
+index 6d16f74f..f7acdd75 100644
+--- a/txscript/script.go
++++ b/txscript/script.go
+@@ -545,6 +545,11 @@ func IsUnspendable(pkScript []byte) bool {
+ // ScriptHasOpSuccess returns true if any op codes in the script contain an
+ // OP_SUCCESS op code.
+ func ScriptHasOpSuccess(witnessScript []byte) bool {
++	return scriptHasOpSuccess(witnessScript, false)
++}
++
++func scriptHasOpSuccess(witnessScript []byte, layerTree bool, versions ...TapscriptLeafVersion) bool {
++	c2 := len(versions) > 0 && versions[0] == LayerTreeLeafVersion
+ 	// First, create a new script tokenizer so we can run through all the
+ 	// elements.
+ 	tokenizer := MakeScriptTokenizer(0, witnessScript)
+@@ -552,6 +557,9 @@ func ScriptHasOpSuccess(witnessScript []byte) bool {
+ 	// Run through all the op codes, returning true if we find anything
+ 	// that is marked as a new op success.
+ 	for tokenizer.Next() {
++		if layerTree && isLayerTreeOpcodeAt(tokenizer.Opcode(), c2) {
++			continue
++		}
+ 		if _, ok := successOpcodes[tokenizer.Opcode()]; ok {
+ 			return true
+ 		}

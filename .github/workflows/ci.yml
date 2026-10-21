@@ -1,0 +1,23 @@
+name: regtest
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.6'
+          cache-dependency-path: go.sum
+      - name: Unit tests, backend tests and regtest scenarios
+        run: make check
+      - name: Race detector
+        run: make unit-race

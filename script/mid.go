@@ -1,0 +1,1657 @@
+package script
+
+import (
+	"crypto/sha256"
+	"encoding/binary"
+	"fmt"
+
+	"github.com/GeorgeTsagk/L3D/tree"
+	"github.com/btcsuite/btcd/btcec/v2/schnorr"
+	"github.com/btcsuite/btcd/txscript"
+)
+
+// This file is a direct port of tools/layertree_mid.py: the MID tier
+// (spec 4.6), i.e. BIP-342 tapscript with leaf-version 0xC0 semantics plus
+// OP_CAT, OP_TX, OP_CHECKSIGFROMSTACK and OP_TWEAKADD. Scripts are
+// assembled with ModeC0 (CScriptNum minimal number encoding).
+//
+// Everything here mirrors the Python token for token, including its
+// oddities, so that the assembled bytes match spec/golden.json exactly.
+
+// MidMaxSum is the largest sum a MID tree may carry: the PADZ gadget only
+// handles script numbers below 2^31.
+const MidMaxSum = uint64(1)<<31 - 1
+
+// midTagPrefix is sha256(tag) || sha256(tag), the BIP-340 tagged-hash
+// prefix that the scripts carry as a literal.
+func midTagPrefix(tag string) []byte {
+	h := sha256.Sum256([]byte(tag))
+	out := make([]byte, 0, 2*sha256.Size)
+	out = append(out, h[:]...)
+	return append(out, h[:]...)
+}
+
+// Script constants shared by the 0xC0 tiers.
+var (
+	midLeafPrefix     = midTagPrefix(tree.TagLeaf)
+	midNodePrefix     = midTagPrefix(tree.TagNode)
+	midStatePrefix    = midTagPrefix(tree.TagState)
+	midVoucherPrefix  = midTagPrefix(tree.TagVoucher)
+	midVoucherHPrefix = midTagPrefix(tree.TagVoucherH)
+	midExitPrefix     = midTagPrefix(tree.TagExit)
+	midPosPrefix      = midTagPrefix(tree.TagPos)
+	midTaptweakPrefix = midTagPrefix("TapTweak")
+
+	// midP2TRPrefix is the OP_1 <32> push prefix of a P2TR scriptPubKey.
+	midP2TRPrefix = []byte{0x51, 0x20}
+
+	// midNumsX is the x-only BIP-341 NUMS point H.
+	midNumsX = schnorr.SerializePubKey(tree.NUMS)
+
+	// midZero4 is four zero bytes, the PADZ target.
+	midZero4 = make([]byte, 4)
+
+	// midEnc64Suffix turns le32(x) into enc64(x) = le64(x) || 0x01.
+	midEnc64Suffix = []byte{0, 0, 0, 0, 1}
+
+	// midEnc0 is enc64(0), the encoding of a zero sum.
+	midEnc0 = tree.Enc64(0)
+
+	// midEmptyLeafHash is E_0's hash, 32 zero bytes.
+	midEmptyLeafHash = make([]byte, 32)
+)
+
+// midEmptyNodeHash is the hash of E_h.
+func midEmptyNodeHash(height int) []byte {
+	n := tree.EmptyNode(height)
+	h := n.Hash
+	return h[:]
+}
+
+// midTagged hashes the top stack element under the given tag prefix.
+func midTagged(prefix []byte) []Token {
+	return []Token{
+		Data(prefix), Op(txscript.OP_SWAP), Op(txscript.OP_CAT),
+		Op(txscript.OP_SHA256),
+	}
+}
+
+// midRoll repeats [n OP_ROLL] `times` times.
+func midRoll(n int64, times int) []Token {
+	out := make([]Token, 0, 2*times)
+	for i := 0; i < times; i++ {
+		out = append(out, Num(n), Op(txscript.OP_ROLL))
+	}
+	return out
+}
+
+// midCat concatenates token slices.
+func midCat(parts ...[]Token) []Token {
+	var out []Token
+	for _, p := range parts {
+		out = append(out, p...)
+	}
+	return out
+}
+
+// midRepeat repeats a token sequence n times.
+func midRepeat(toks []Token, n int) []Token {
+	out := make([]Token, 0, len(toks)*n)
+	for i := 0; i < n; i++ {
+		out = append(out, toks...)
+	}
+	return out
+}
+
+// midNonneg is the NONNEG check: [x] -> [x], failing unless x is a
+// minimal non-negative CScriptNum. OP_ABS re-encodes |x| minimally, so the
+// comparison also rejects a negative zero and every non-minimal encoding
+// whatever the MINIMALDATA policy. It guards every witness-supplied number
+// that enters a sum (a sibling sum, a leaf amount, a joined sum): a
+// four-byte number with its top bit set is negative under CScriptNum and
+// would otherwise pass PADZ as the le32 of a value in [2^31, 2^32).
+func midNonneg() []Token {
+	return []Token{Op(txscript.OP_DUP), Op(txscript.OP_DUP),
+		Op(txscript.OP_ABS), Op(txscript.OP_EQUALVERIFY)}
+}
+
+// midPadz is the PADZ gadget: [x z w] -> [le32(x)].
+func midPadz() []Token {
+	return []Token{
+		Op(txscript.OP_OVER), Op(txscript.OP_SWAP), Op(txscript.OP_CAT),
+		Data(midZero4), Op(txscript.OP_EQUALVERIFY),
+		Op(txscript.OP_SIZE), Op(txscript.OP_ROT), Op(txscript.OP_SIZE),
+		Op(txscript.OP_ROT), Op(txscript.OP_ADD), Num(4),
+		Op(txscript.OP_NUMEQUALVERIFY),
+		Op(txscript.OP_SWAP), Op(txscript.OP_CAT),
+	}
+}
+
+// midEnc64 is [x z w] -> [enc64(x)].
+func midEnc64() []Token {
+	return append(midPadz(), Data(midEnc64Suffix), Op(txscript.OP_CAT))
+}
+
+// midLe64 is [x z w] -> [le64(x)].
+func midLe64() []Token {
+	return append(midPadz(), Data(midZero4), Op(txscript.OP_CAT))
+}
+
+// midTreeSpkMin is F.tree_spk_min: [r m] -> [spk] using OP_TWEAKADD.
+func midTreeSpkMin() []Token {
+	return midCat(
+		[]Token{Op(txscript.OP_SWAP)},
+		midTagged(midStatePrefix),
+		[]Token{
+			Data(midNumsX), Op(OP_TWEAKADD),
+			Op(txscript.OP_TUCK), Op(txscript.OP_SWAP),
+			Op(txscript.OP_CAT),
+		},
+		midTagged(midTaptweakPrefix),
+		[]Token{
+			Op(txscript.OP_SWAP), Op(OP_TWEAKADD),
+			Data(midP2TRPrefix), Op(txscript.OP_SWAP),
+			Op(txscript.OP_CAT),
+		},
+	)
+}
+
+// midPrologue checks that the spent input is #0 and that (root, m) match
+// its scriptPubKey, leaving them on the altstack.
+func midPrologue() []Token {
+	return midCat(
+		[]Token{
+			Num(SelCurrInput), Op(OP_TX), Op(txscript.OP_0),
+			Op(txscript.OP_NUMEQUALVERIFY), Op(txscript.OP_2DUP),
+		},
+		midTreeSpkMin(),
+		[]Token{
+			Num(SelInSpk), Op(OP_TX), Op(txscript.OP_EQUALVERIFY),
+			Op(txscript.OP_TOALTSTACK), Op(txscript.OP_TOALTSTACK),
+		},
+	)
+}
+
+// midLevelWitness is the number of witness elements a level consumes.
+const midLevelWitness = 9
+
+// midLevel folds one proof level: [9 witness] T oh os nh ns -> T oh' os' nh' ns'.
+func midLevel(sparse bool) []Token {
+	s := midRoll(13, midLevelWitness)
+	if sparse {
+		s = append(s, midRoll(3, 1)...)
+		s = append(s, []Token{
+			Op(txscript.OP_FROMALTSTACK),
+			Op(txscript.OP_SWAP), Op(txscript.OP_SIZE),
+			Op(txscript.OP_0NOTEQUAL),
+			Op(txscript.OP_NOTIF), Op(txscript.OP_DROP),
+			Op(txscript.OP_DUP), Op(txscript.OP_ENDIF),
+			Op(txscript.OP_SWAP), Data(midEnc0), Op(txscript.OP_CAT),
+			Op(txscript.OP_DUP), Op(txscript.OP_CAT),
+			Data(midNodePrefix), Op(txscript.OP_SWAP),
+			Op(txscript.OP_CAT), Op(txscript.OP_SHA256),
+			Op(txscript.OP_FROMALTSTACK), Op(txscript.OP_FROMALTSTACK),
+			Num(7), Op(txscript.OP_PICK),
+			Op(txscript.OP_IF), Op(txscript.OP_OVER),
+			Op(txscript.OP_ADD), Op(txscript.OP_ENDIF),
+			Op(txscript.OP_SWAP), Op(txscript.OP_DUP),
+			Op(txscript.OP_ADD),
+			Op(txscript.OP_SWAP), Op(txscript.OP_TOALTSTACK),
+			Op(txscript.OP_TOALTSTACK),
+			Op(txscript.OP_TOALTSTACK),
+		}...)
+		s = append(s, midRoll(3, 3)...)
+	}
+	// sibling: sc = sh || enc64(ss); keep ss, which must be non-negative
+	s = append(s, Num(2), Op(txscript.OP_PICK))
+	s = append(s, midNonneg()...)
+	s = append(s, Op(txscript.OP_TOALTSTACK))
+	s = append(s, midEnc64()...)
+	s = append(s, Op(txscript.OP_CAT), Op(txscript.OP_FROMALTSTACK))
+	// new accumulator
+	s = append(s, Num(7), Op(txscript.OP_PICK), Op(txscript.OP_OVER),
+		Op(txscript.OP_ADD), Op(txscript.OP_TOALTSTACK))
+	s = append(s, midRoll(7, 1)...)
+	s = append(s, midRoll(5, 2)...)
+	s = append(s, midEnc64()...)
+	s = append(s, midRoll(6, 1)...)
+	s = append(s, Op(txscript.OP_SWAP), Op(txscript.OP_CAT))
+	s = append(s, []Token{
+		Num(2), Op(txscript.OP_PICK), Op(txscript.OP_SWAP), Num(4),
+		Op(txscript.OP_PICK),
+		Op(txscript.OP_NOTIF), Op(txscript.OP_SWAP),
+		Op(txscript.OP_ENDIF), Op(txscript.OP_CAT),
+		Num(8), Op(txscript.OP_PICK), Op(txscript.OP_SWAP),
+		Op(txscript.OP_CAT), Op(txscript.OP_SHA256),
+		Op(txscript.OP_TOALTSTACK),
+	}...)
+	// old accumulator
+	s = append(s, []Token{
+		Num(5), Op(txscript.OP_PICK), Op(txscript.OP_OVER),
+		Op(txscript.OP_ADD), Op(txscript.OP_TOALTSTACK),
+		Op(txscript.OP_DROP),
+	}...)
+	s = append(s, midRoll(4, 1)...)
+	s = append(s, midRoll(4, 2)...)
+	s = append(s, midEnc64()...)
+	s = append(s, midRoll(3, 1)...)
+	s = append(s, []Token{
+		Op(txscript.OP_SWAP), Op(txscript.OP_CAT), Op(txscript.OP_ROT),
+		Op(txscript.OP_NOTIF), Op(txscript.OP_SWAP),
+		Op(txscript.OP_ENDIF), Op(txscript.OP_CAT),
+		Op(txscript.OP_OVER), Op(txscript.OP_SWAP), Op(txscript.OP_CAT),
+		Op(txscript.OP_SHA256),
+		Op(txscript.OP_FROMALTSTACK), Op(txscript.OP_FROMALTSTACK),
+		Op(txscript.OP_FROMALTSTACK),
+	}...)
+	return s
+}
+
+// midLevels repeats midLevel for levels height..depth-1.
+func midLevels(sparse bool, depth, height int) []Token {
+	var out []Token
+	for i := height; i < depth; i++ {
+		out = append(out, midLevel(sparse)...)
+	}
+	return out
+}
+
+// midSparseSetup verifies H_pos and primes the direction accumulator.
+func midSparseSetup() []Token {
+	return midCat(
+		[]Token{Op(txscript.OP_2SWAP), Op(txscript.OP_CAT)},
+		midTagged(midPosPrefix),
+		[]Token{
+			Op(txscript.OP_ROT), Op(txscript.OP_DUP),
+			Op(txscript.OP_TOALTSTACK),
+			Op(txscript.OP_SIZE), Num(4), Op(txscript.OP_EQUALVERIFY),
+			Op(txscript.OP_ROT), Op(txscript.OP_CAT),
+			Op(txscript.OP_EQUALVERIFY),
+			Op(txscript.OP_0), Op(txscript.OP_TOALTSTACK),
+			Op(txscript.OP_1), Op(txscript.OP_TOALTSTACK),
+			Data(midEmptyLeafHash), Op(txscript.OP_TOALTSTACK),
+		},
+	)
+}
+
+// midSparseTeardown checks the accumulated position against pos_lo.
+func midSparseTeardown() []Token {
+	return []Token{
+		Op(txscript.OP_FROMALTSTACK), Op(txscript.OP_DROP),
+		Op(txscript.OP_FROMALTSTACK), Op(txscript.OP_DROP),
+		Op(txscript.OP_FROMALTSTACK), Op(txscript.OP_FROMALTSTACK),
+		Op(txscript.OP_NUMEQUALVERIFY),
+	}
+}
+
+// midCheckOld checks the old root and the input amount.
+func midCheckOld(sparse bool) []Token {
+	s := []Token{Op(txscript.OP_2SWAP)}
+	s = append(s, midRoll(6, 2)...)
+	s = append(s, midLe64()...)
+	s = append(s, Num(SelInAmount), Op(OP_TX), Op(txscript.OP_EQUALVERIFY))
+	if sparse {
+		s = append(s, midSparseTeardown()...)
+	}
+	return append(s, Op(txscript.OP_FROMALTSTACK), Op(txscript.OP_EQUALVERIFY))
+}
+
+// midCheckPrev chains a further transition onto the previous result.
+func midCheckPrev(sparse bool) []Token {
+	s := []Token{Op(txscript.OP_2SWAP)}
+	if sparse {
+		s = append(s, midSparseTeardown()...)
+	}
+	return append(s,
+		Op(txscript.OP_FROMALTSTACK), Op(txscript.OP_NUMEQUALVERIFY),
+		Op(txscript.OP_FROMALTSTACK), Op(txscript.OP_EQUALVERIFY))
+}
+
+// midFinal emits the new tree output, or succeeds if the tree is empty.
+func midFinal(depth int) []Token {
+	s := []Token{
+		Op(txscript.OP_ROT), Op(txscript.OP_DROP),
+		Op(txscript.OP_OVER), Data(midEmptyNodeHash(depth)),
+		Op(txscript.OP_EQUAL),
+		Op(txscript.OP_IF), Op(txscript.OP_2DROP), Op(txscript.OP_2DROP),
+		Op(txscript.OP_FROMALTSTACK), Op(txscript.OP_DROP),
+		Op(txscript.OP_1),
+		Op(txscript.OP_ELSE),
+	}
+	s = append(s, midRoll(3, 2)...)
+	s = append(s, midLe64()...)
+	s = append(s, Op(txscript.OP_SWAP), Op(txscript.OP_FROMALTSTACK))
+	s = append(s, midTreeSpkMin()...)
+	return append(s,
+		Op(txscript.OP_0), Num(SelOutSingle), Op(OP_TX),
+		Op(txscript.OP_ROT), Op(txscript.OP_EQUALVERIFY),
+		Op(txscript.OP_EQUAL), Op(txscript.OP_ENDIF))
+}
+
+// midLeafWitnessLen is the number of witness elements per leaf.
+const midLeafWitnessLen = 10
+
+// midFieldSizes is the (pick depth, size) table leaf_join checks.
+var midFieldSizes = [7][2]int64{{0, 4}, {1, 4}, {2, 4}, {3, 32}, {4, 32}, {5, 32}, {6, 8}}
+
+// midLeafJoin re-joins the seven leaf pieces under OP_SIZE checks.
+func midLeafJoin() []Token {
+	s := []Token{Num(2), Op(txscript.OP_PICK)}
+	s = append(s, midNonneg()...)
+	s = append(s, Op(txscript.OP_TOALTSTACK))
+	s = append(s, midLe64()...)
+	s = append(s, Num(7), Op(txscript.OP_PICK), Op(txscript.OP_EQUALVERIFY))
+	for _, f := range midFieldSizes {
+		d, size := f[0], f[1]
+		if d != 0 {
+			s = append(s, Num(d), Op(txscript.OP_PICK))
+		} else {
+			s = append(s, Op(txscript.OP_DUP))
+		}
+		s = append(s, Op(txscript.OP_SIZE), Num(size),
+			Op(txscript.OP_EQUALVERIFY), Op(txscript.OP_DROP))
+	}
+	return append(s, midRepeat([]Token{Op(txscript.OP_CAT)}, 6)...)
+}
+
+// midExitBlockFull is one complete exit: authorisation, payout check, leaf
+// reassembly and the proof levels.
+// midTowerAuth is the owner branch of EXIT_K^t under 0xC0 numerics (spec
+// 7.2 rule 7), shared with the CCV tier's 0xC0 scripts:
+// [leaf(10) ea_num ze we sig] -> [leaf(10) ea_num ze we], where sig MUST
+// be a BIP-340 signature by the leaf's owner key over
+// H_exit(tree_id || body(leaf)), checked with OP_CHECKSIGFROMSTACK. The
+// leaf body (the six fields after amt8, spec 5.2) is rejoined from its
+// field elements, each 12 deep under sig, as midVoucherAuth does for
+// CLAIM; amt8 is left out, so an amount-only increase by REWRITE_h rule 3
+// leaves the authorisation valid. ok sits 12 deep once the message
+// replaces the copies (tools/layertree_mid.py tower_auth).
+func midTowerAuth(treeID [32]byte) []Token {
+	s := midRepeat([]Token{Num(12), Op(txscript.OP_PICK)}, 6)
+	s = append(s, midRepeat([]Token{Op(txscript.OP_CAT)}, 5)...)
+	s = append(s, Data(treeID[:]), Op(txscript.OP_SWAP), Op(txscript.OP_CAT))
+	s = append(s, midTagged(midExitPrefix)...)
+	return append(s, Num(12), Op(txscript.OP_PICK), Op(OP_CHECKSIGFROMSTACK),
+		Op(txscript.OP_VERIFY))
+}
+
+// midExitAuth is the authorisation of one MID exit block:
+// [leaf(10) ea_num ze we sig is_evict] -> [leaf(10)], is_evict parked on
+// the altstack. Eviction: a transaction signature by evk under the lock
+// time, ea_num checked against the ea field by PADZ. Owner: a transaction
+// signature by ok, or with tower set (EXIT_K^t, spec 7.2 rule 7) the
+// off-chain authorisation of midTowerAuth (tools/layertree_mid.py
+// exit_auth).
+func midExitAuth(tower bool, treeID [32]byte) []Token {
+	s := []Token{
+		Op(txscript.OP_DUP), Op(txscript.OP_TOALTSTACK), Op(txscript.OP_IF),
+		Num(3), Op(txscript.OP_PICK), Op(txscript.OP_CHECKLOCKTIMEVERIFY),
+		Op(txscript.OP_DROP),
+		Num(10), Op(txscript.OP_PICK), Op(txscript.OP_CHECKSIGVERIFY),
+	}
+	s = append(s, midPadz()...)
+	s = append(s, Num(6), Op(txscript.OP_PICK), Op(txscript.OP_EQUALVERIFY),
+		Op(txscript.OP_ELSE))
+	if tower {
+		s = append(s, midTowerAuth(treeID)...)
+	} else {
+		s = append(s, Num(11), Op(txscript.OP_PICK), Op(txscript.OP_CHECKSIGVERIFY))
+	}
+	return append(s, Op(txscript.OP_2DROP), Op(txscript.OP_DROP),
+		Op(txscript.OP_ENDIF))
+}
+
+// midExitBlockFull is one MID exit block, -> T oh os nh ns after the
+// levels. tower is EXIT_K^t (spec 7.2 rule 7).
+func midExitBlockFull(sparse bool, depth, outIndex int, tower bool,
+	treeID [32]byte) []Token {
+
+	s := midExitAuth(tower, treeID)
+	s = append(s, []Token{
+		Num(int64(outIndex)), Num(SelOutSingle), Op(OP_TX),
+		Data(midP2TRPrefix), Num(11), Op(txscript.OP_PICK),
+		Op(txscript.OP_CAT), Op(txscript.OP_EQUALVERIFY),
+		Num(10), Op(txscript.OP_PICK), Op(txscript.OP_EQUALVERIFY),
+		Op(txscript.OP_FROMALTSTACK), Op(txscript.OP_DROP),
+	}...)
+	s = append(s, midLeafJoin()...)
+	s = append(s, midTagged(midLeafPrefix)...)
+	s = append(s, Op(txscript.OP_FROMALTSTACK))
+	if sparse {
+		s = append(s, midRoll(5, 4)...)
+		s = append(s, midSparseSetup()...)
+	}
+	s = append(s, Data(midNodePrefix), Op(txscript.OP_ROT),
+		Op(txscript.OP_ROT), Data(midEmptyLeafHash), Op(txscript.OP_0))
+	return append(s, midLevels(sparse, depth, 0)...)
+}
+
+// MidExitScript is the MID-tier EXIT_k script for a tree of the given depth.
+func MidExitScript(depth, k int, sparse bool) []Token {
+	return midExitScript(depth, k, sparse, false, [32]byte{})
+}
+
+// MidExitTowerScript is EXIT_K^t under MID (spec 7.2 rule 7): EXIT_K whose
+// owner branch takes the off-chain authorisation over treeID, a constant
+// of the script, in place of a transaction signature. A tree-creation
+// parameter that replaces EXIT_K (tools/layertree_mid.py exit_script
+// tower=True).
+func MidExitTowerScript(depth, k int, treeID [32]byte, sparse bool) []Token {
+	return midExitScript(depth, k, sparse, true, treeID)
+}
+
+func midExitScript(depth, k int, sparse, tower bool, treeID [32]byte) []Token {
+	s := midPrologue()
+	s = append(s, midExitBlockFull(sparse, depth, 1, tower, treeID)...)
+	s = append(s, midCheckOld(sparse)...)
+	for i := 2; i <= k; i++ {
+		s = append(s, Op(txscript.OP_SWAP), Op(txscript.OP_TOALTSTACK),
+			Op(txscript.OP_TOALTSTACK), Op(txscript.OP_DROP))
+		s = append(s, midExitBlockFull(sparse, depth, i, tower, treeID)...)
+		s = append(s, midCheckPrev(sparse)...)
+	}
+	return append(s, midFinal(depth)...)
+}
+
+// midJoinBlock inserts one new subtree (dense) or leaf (sparse).
+func midJoinBlock(sparse bool, depth, height int) []Token {
+	if !sparse {
+		s := midNonneg() // new_sum >= 0
+		s = append(s, []Token{
+			Op(txscript.OP_OVER), Op(txscript.OP_SIZE), Num(32),
+			Op(txscript.OP_EQUALVERIFY), Op(txscript.OP_DROP),
+			Data(midNodePrefix), Op(txscript.OP_ROT), Op(txscript.OP_ROT),
+			Data(midEmptyNodeHash(height)), Op(txscript.OP_0),
+			Op(txscript.OP_2SWAP),
+		}...)
+		return append(s, midLevels(false, depth, height)...)
+	}
+	s := midLeafJoin()
+	s = append(s, midTagged(midLeafPrefix)...)
+	s = append(s, Op(txscript.OP_FROMALTSTACK))
+	s = append(s, midRoll(5, 4)...)
+	s = append(s, midSparseSetup()...)
+	s = append(s, Data(midNodePrefix), Op(txscript.OP_ROT),
+		Op(txscript.OP_ROT), Data(midEmptyLeafHash), Op(txscript.OP_0),
+		Op(txscript.OP_2SWAP))
+	return append(s, midLevels(true, depth, 0)...)
+}
+
+// MidJoinScript is the MID-tier JOIN script (k chained joins).
+func MidJoinScript(depth, height int, operatorKey [32]byte, sparse bool, k int) []Token {
+	s := midPrologue()
+	s = append(s, Data(operatorKey[:]), Op(txscript.OP_CHECKSIGVERIFY))
+	s = append(s, midJoinBlock(sparse, depth, height)...)
+	s = append(s, midCheckOld(sparse)...)
+	for i := 2; i <= k; i++ {
+		s = append(s, Op(txscript.OP_SWAP), Op(txscript.OP_TOALTSTACK),
+			Op(txscript.OP_TOALTSTACK), Op(txscript.OP_DROP))
+		s = append(s, midJoinBlock(sparse, depth, height)...)
+		s = append(s, midCheckPrev(sparse)...)
+	}
+	return append(s, midFinal(depth)...)
+}
+
+// MidUpdateScript is the MID-tier UPDATE script: a cooperative leaf rewrite.
+func MidUpdateScript(depth int, operatorKey [32]byte, sparse bool) []Token {
+	return midUpdateScript(depth, operatorKey, sparse, false)
+}
+
+// MidUpdateXScript is the MID-tier UPDATE^x script (spec 7.4 rule 5): UPDATE
+// with one more signature, directly above opsig in the witness, that MUST be
+// valid over the same transaction by the old leaf's exit key. It is a
+// tree-creation parameter: a tree uses either UPDATE or UPDATE^x, never both.
+func MidUpdateXScript(depth int, operatorKey [32]byte, sparse bool) []Token {
+	return midUpdateScript(depth, operatorKey, sparse, true)
+}
+
+// midUpdateScript is the shared body of the MID UPDATE and UPDATE^x scripts.
+func midUpdateScript(depth int, operatorKey [32]byte, sparse,
+	exitConsent bool) []Token {
+
+	s := midPrologue()
+	if exitConsent {
+		// old.ek sits 21 elements below the exit signature.
+		s = append(s, Num(21), Op(txscript.OP_PICK),
+			Op(txscript.OP_CHECKSIGVERIFY))
+	}
+	s = append(s, Data(operatorKey[:]), Op(txscript.OP_CHECKSIGVERIFY),
+		Num(18), Op(txscript.OP_PICK), Op(txscript.OP_CHECKSIGVERIFY))
+	if sparse {
+		s = append(s,
+			Num(8), Op(txscript.OP_PICK), Num(19), Op(txscript.OP_PICK),
+			Op(txscript.OP_EQUALVERIFY),
+			Num(5), Op(txscript.OP_PICK), Num(16), Op(txscript.OP_PICK),
+			Op(txscript.OP_EQUALVERIFY))
+	}
+	s = append(s, midLeafJoin()...)
+	s = append(s, Op(txscript.OP_TOALTSTACK))
+	s = append(s, midLeafJoin()...)
+	s = append(s, midTagged(midLeafPrefix)...)
+	s = append(s, Op(txscript.OP_FROMALTSTACK), Op(txscript.OP_FROMALTSTACK),
+		Op(txscript.OP_FROMALTSTACK), Op(txscript.OP_SWAP))
+	s = append(s, midTagged(midLeafPrefix)...)
+	s = append(s, Op(txscript.OP_SWAP))
+	if sparse {
+		s = append(s, midRoll(7, 4)...)
+		s = append(s, midSparseSetup()...)
+	}
+	s = append(s, Data(midNodePrefix))
+	s = append(s, midRoll(4, 4)...)
+	s = append(s, midLevels(sparse, depth, 0)...)
+	s = append(s, midCheckOld(sparse)...)
+	return append(s, midFinal(depth)...)
+}
+
+// MidClaimScript is the MID-tier CLAIM script: a voucher redemption that
+// drains a source leaf into a new claim leaf. treeID is the tree's voucher
+// binding (spec 6.2), a constant of the script.
+// dustMin is the tree's DUST_MIN (6.2, 7.5 rule 6), zero meaning
+// tree.DustMin; CLAIM^h and SPLIT take it the same way
+// (tools/layertree_mid.py claim_script dust_min).
+func MidClaimScript(depth int, treeID [32]byte, sparse bool,
+	dustMin uint64) []Token {
+
+	return midCarveScript(depth, treeID, sparse, authVoucher, false, dustMin)
+}
+
+// MidClaimHScript is the MID-tier CLAIM^h script (spec 7.5.1): CLAIM with a
+// 32-byte preimage in the witness between vsig and r, whose SHA256 is
+// appended to the signed voucher message under a separate tag. The preimage
+// is hashed straight into the message, so a wrong one fails as a bad
+// signature. It is a tree-creation parameter: a tree uses either CLAIM or
+// CLAIM^h, never both.
+func MidClaimHScript(depth int, treeID [32]byte, sparse bool,
+	dustMin uint64) []Token {
+
+	return midCarveScript(depth, treeID, sparse, authHashlock, false, dustMin)
+}
+
+// MidClaimXScript is the MID-tier CLAIM^x script (spec 7.5.3): CLAIM plus a
+// signature over the transaction by the source leaf's exit key, the element
+// directly below r. The exit key is the second field of the source block,
+// midCarveExitDepth deep under that signature, so the check is one OP_PICK
+// and one OP_CHECKSIGVERIFY before anything else: four bytes over CLAIM,
+// as UPDATE^x over UPDATE in this tier (tools/layertree_mid.py
+// claim_script exit_consent).
+func MidClaimXScript(depth int, treeID [32]byte, sparse bool,
+	dustMin uint64) []Token {
+
+	return midCarveScript(depth, treeID, sparse, authVoucher, true, dustMin)
+}
+
+// MidClaimHXScript is the MID-tier CLAIM^hx script (spec 7.5.3): CLAIM^h
+// with the exit-key signature of CLAIM^x, which sits above the preimage, so
+// the pick is one deeper.
+func MidClaimHXScript(depth int, treeID [32]byte, sparse bool,
+	dustMin uint64) []Token {
+
+	return midCarveScript(depth, treeID, sparse, authHashlock, true, dustMin)
+}
+
+// MidSplitScript is the MID-tier SPLIT script (spec 7.5.2): CLAIM with the
+// owner's transaction signature in place of the voucher, so the witness
+// carries no preimage and no voucher message is rebuilt. It needs no
+// OP_CHECKSIGFROMSTACK and no tree_id. Like CLAIM^h it is a tree-creation
+// parameter and stays out of MidAllScripts.
+func MidSplitScript(depth int, sparse bool, dustMin uint64) []Token {
+	return midCarveScript(depth, [32]byte{}, sparse, authOwner, false, dustMin)
+}
+
+// The MID carve witness holds, below the authorisation element, src(10)
+// claim(10) and thirteen extras: seq_num and its pad, the pad of seq + 1,
+// the pad of the new source amount, and the minimal evict_after of the
+// source and of the claim leaf with their pads (midCarveRules). The depth
+// of a source field under the authorisation element follows from that
+// layout: src.ok, the third field, sits 31 deep, and under CLAIM^x, where
+// the voucher signature sits between the exit signature and the blocks,
+// src.ek, the second field, 33 deep (34 with the preimage of CLAIM^hx).
+const (
+	midCarveExtras     = 13
+	midCarveOwnerDepth = 31
+	midCarveExitDepth  = 33
+)
+
+// midVoucherAuth is the voucher check of CLAIM and CLAIM^h under 0xC0
+// numerics (spec 7.5 rule 1, 7.5.1 rule 1), shared with the CCV tier's 0xC0
+// scripts: [src(10) claim(10) extras(13) vsig] -> [src(10) claim(10)
+// extras(13)], with SHA256(preimage) parked on the altstack beforehand under
+// hashlock. The message H_voucher(tree_id || body(src) || claim) is
+// assembled from the leaf fields of each block by thirteen OP_PICKs: the
+// six fields of the source body (everything after amt8, spec 5.2) sit 32
+// deep under vsig, the seven of the claim leaf 24 deep once the body is on
+// the stack, and src.ok 32 deep once the message replaces the copies. The
+// source amount is left out, so an amount-only increase by REWRITE_h rule 3
+// does not void an outstanding voucher (tools/layertree_mid.py
+// voucher_auth).
+func midVoucherAuth(treeID [32]byte, hashlock bool) []Token {
+	s := midRepeat([]Token{Num(32), Op(txscript.OP_PICK)}, 6)
+	s = append(s, midRepeat([]Token{Op(txscript.OP_CAT)}, 5)...)
+	s = append(s, midRepeat([]Token{Num(24), Op(txscript.OP_PICK)}, 7)...)
+	s = append(s, midRepeat([]Token{Op(txscript.OP_CAT)}, 6)...)
+	s = append(s, Op(txscript.OP_CAT), Data(treeID[:]), Op(txscript.OP_SWAP),
+		Op(txscript.OP_CAT))
+	prefix := midVoucherPrefix
+	if hashlock {
+		s = append(s, Op(txscript.OP_FROMALTSTACK), Op(txscript.OP_CAT))
+		prefix = midVoucherHPrefix
+	}
+	s = append(s, midTagged(prefix)...)
+	return append(s, Num(32), Op(txscript.OP_PICK), Op(OP_CHECKSIGFROMSTACK),
+		Op(txscript.OP_VERIFY))
+}
+
+// midCarveScript is the shared body of the MID CLAIM, CLAIM^h and SPLIT
+// scripts: auth selects the authorisation and nothing else, and exitConsent
+// (CLAIM^x, CLAIM^hx) consumes one more element, xsig, directly below r,
+// before anything else, so every depth below is as in the plain form.
+func midCarveScript(depth int, treeID [32]byte, sparse bool, auth string,
+	exitConsent bool, dustMin uint64) []Token {
+
+	hashlock := auth == authHashlock
+	s := midPrologue() // ... extras(7) vsig [pre] [xsig] | m r
+	if exitConsent {
+		pick := int64(midCarveExitDepth)
+		if hashlock {
+			pick++
+		}
+		s = append(s, Num(pick), Op(txscript.OP_PICK), // ... vsig [pre] xsig src.ek
+			Op(txscript.OP_CHECKSIGVERIFY)) // ... extras(7) vsig [pre]
+	}
+	if auth == authOwner {
+		// SPLIT (7.5.2): the owner signs the transaction, so no message is
+		// rebuilt. src.ok sits midCarveOwnerDepth deep, since the witness
+		// holds src(10) claim(10) extras(13) below the signature and the
+		// owner key is the third field of the source leaf block.
+		s = append(s, Num(midCarveOwnerDepth), Op(txscript.OP_PICK), // ... osig src.ok
+			Op(txscript.OP_CHECKSIGVERIFY)) // src(10) claim(10) extras(7)
+	} else {
+		if hashlock {
+			// Park SHA256(preimage) on the altstack: every pick depth below
+			// is exactly as in CLAIM.
+			s = append(s, Op(txscript.OP_SIZE), Num(32),
+				Op(txscript.OP_EQUALVERIFY), Op(txscript.OP_SHA256),
+				Op(txscript.OP_TOALTSTACK))
+		}
+		s = append(s, midVoucherAuth(treeID, hashlock)...)
+	}
+	s = append(s, midCarveSource(depth, sparse, dustMin)...)
+	s = append(s, midCheckOld(sparse)...)
+	s = append(s, Op(txscript.OP_FROMALTSTACK), Op(txscript.OP_FROMALTSTACK))
+	s = append(s, midCarveClaim(depth, sparse)...)
+	return append(s, midFinal(depth)...)
+}
+
+// midCarveRules is the carve rule of spec 7.5 rule 5 under 0xC0 numerics:
+// [src(10) claim(10) extras(7) sea zse wse cea zce wce] -> [src(10)
+// claim(10) extras(7)]. The claim leaf's evictor_key must equal the
+// source's, and its evict_after, supplied as a minimal number with a PADZ
+// pad like the source's, must be no later: each pad is checked against the
+// leaf's own field, the claim's number is NONNEG-checked (a field of
+// 01 00 00 81 is a negative CScriptNum with an empty pad, which the
+// compare alone would accept and CLTV would then reject for good, 10.6),
+// and the two numbers compared (tools/layertree_mid.py carve_rules).
+func midCarveRules(dustMin uint64) []Token {
+	s := []Token{
+		Num(19), Op(txscript.OP_PICK), Num(30), Op(txscript.OP_PICK),
+		Op(txscript.OP_EQUALVERIFY),                              // claim.evk == src.evk
+		Num(2), Op(txscript.OP_PICK), Op(txscript.OP_TOALTSTACK), // | cea
+	}
+	s = append(s, midPadz()...) // ... sea zse wse le32(cea)
+	s = append(s, Num(16), Op(txscript.OP_PICK), Op(txscript.OP_EQUALVERIFY),
+		Num(2), Op(txscript.OP_PICK), Op(txscript.OP_TOALTSTACK)) // | cea sea
+	s = append(s, midPadz()...) // ... le32(sea)
+	s = append(s, Num(23), Op(txscript.OP_PICK), Op(txscript.OP_EQUALVERIFY),
+		Op(txscript.OP_FROMALTSTACK), Op(txscript.OP_FROMALTSTACK)) // sea cea
+	s = append(s, midNonneg()...) // cea >= 0
+	return append(s,
+		Op(txscript.OP_GREATERTHANOREQUAL), Op(txscript.OP_VERIFY), // sea >= cea
+		// The claim amount is the block's amt_num, bound to the amount
+		// field by LEAF_JOIN, so the DUST_MIN floor of 7.5 rule 6 is one
+		// comparison against the constant.
+		dustNum(dustMin), Num(10), Op(txscript.OP_PICK),
+		Op(txscript.OP_LESSTHANOREQUAL), Op(txscript.OP_VERIFY)) // DUST_MIN <= claim.amt_num
+}
+
+// midCarveSource is step 1 of CLAIM, CLAIM^h and SPLIT, after the
+// authorisation check. Stack on entry: src(10) claim(10) extras(13) ;
+// altstack: .. m r. On exit: T oh os nh ns over the source path ; altstack:
+// .. m claim_leaf amt_c r. The MIN tier shares it.
+func midCarveSource(depth int, sparse bool, dustMin uint64) []Token {
+	return midCarveSourceAlt(depth, sparse, true, dustMin)
+}
+
+// midCarveSourceAlt is midCarveSource with the altstack's r optional: the
+// CCV tier's 0xC0 numerics carry no r, so with altR false the altstack
+// holds .. claim_leaf amt_c on exit (layertree_mid.carve_source alt_r).
+func midCarveSourceAlt(depth int, sparse, altR bool,
+	dustMin uint64) []Token {
+
+	s := midCarveRules(dustMin) // src(10) claim(10) extras(7)
+	// seq consistency: le32(seq_num) == src.seq
+	s = append(s, Num(20), Op(txscript.OP_PICK), Num(7), Op(txscript.OP_PICK))
+	s = append(s, midRoll(7, 2)...)
+	s = append(s, midPadz()...)
+	s = append(s, Op(txscript.OP_EQUALVERIFY))
+	s = append(s, midRepeat([]Token{Op(txscript.OP_TOALTSTACK)}, 5)...)
+	s = append(s, midLeafJoin()...)
+	s = append(s, Op(txscript.OP_TOALTSTACK))
+	s = append(s, midRepeat([]Token{Num(8), Op(txscript.OP_PICK)}, 5)...)
+	s = append(s, midRepeat([]Token{Op(txscript.OP_CAT)}, 4)...)
+	s = append(s, Op(txscript.OP_TOALTSTACK))
+	s = append(s, midLeafJoin()...)
+	s = append(s, midTagged(midLeafPrefix)...)
+	s = append(s, Op(txscript.OP_FROMALTSTACK), Op(txscript.OP_DUP),
+		Op(txscript.OP_FROMALTSTACK),
+		Op(txscript.OP_FROMALTSTACK), Op(txscript.OP_FROMALTSTACK))
+	s = append(s, midRepeat([]Token{Op(txscript.OP_FROMALTSTACK)}, 5)...)
+	if altR {
+		s = append(s, Op(txscript.OP_FROMALTSTACK), Num(7), Op(txscript.OP_PICK),
+			Op(txscript.OP_TOALTSTACK), Num(6), Op(txscript.OP_PICK),
+			Op(txscript.OP_TOALTSTACK), Op(txscript.OP_TOALTSTACK))
+	} else {
+		s = append(s, Num(6), Op(txscript.OP_PICK), Op(txscript.OP_TOALTSTACK),
+			Num(5), Op(txscript.OP_PICK), Op(txscript.OP_TOALTSTACK))
+	}
+	s = append(s, midRoll(6, 1)...)
+	s = append(s, Op(txscript.OP_DROP))
+	s = append(s, midRoll(7, 1)...)
+	s = append(s, midRoll(6, 1)...)
+	s = append(s, Op(txscript.OP_SUB),
+		Op(txscript.OP_DUP), Op(txscript.OP_0),
+		Op(txscript.OP_GREATERTHANOREQUAL), Op(txscript.OP_VERIFY),
+		Op(txscript.OP_DUP))
+	s = append(s, midRoll(3, 2)...)
+	s = append(s, midLe64()...)
+	s = append(s, midRoll(4, 1)...)
+	s = append(s, Op(txscript.OP_1ADD))
+	s = append(s, midRoll(4, 2)...)
+	s = append(s, midPadz()...)
+	s = append(s, midRoll(3, 1)...)
+	s = append(s, Op(txscript.OP_SWAP), Op(txscript.OP_CAT),
+		Op(txscript.OP_CAT))
+	s = append(s, midTagged(midLeafPrefix)...)
+	s = append(s, Op(txscript.OP_SWAP))
+	s = append(s, fullDrainRule(dustMin)...) // drained -> E_0, else ns >= DUST_MIN
+	if sparse {
+		s = append(s, midRoll(7, 4)...)
+		s = append(s, midSparseSetup()...)
+	}
+	s = append(s, Data(midNodePrefix))
+	s = append(s, midRoll(4, 4)...)
+	return append(s, midLevels(sparse, depth, 0)...)
+}
+
+// midCarveClaim is step 2: the new leaf into an empty position, proven
+// against the root step 1 produced. Stack on entry: T nh1 ns1 amt_c
+// claim_leaf. On exit: T nh2 ns2.
+func midCarveClaim(depth int, sparse bool) []Token {
+	s := midTagged(midLeafPrefix)
+	s = append(s, Op(txscript.OP_SWAP),
+		Op(txscript.OP_2SWAP), Op(txscript.OP_SWAP),
+		Op(txscript.OP_TOALTSTACK), Op(txscript.OP_TOALTSTACK))
+	if sparse {
+		s = append(s, midRoll(6, 4)...)
+		s = append(s, midSparseSetup()...)
+	}
+	s = append(s, Data(midEmptyLeafHash), Op(txscript.OP_0),
+		Op(txscript.OP_2SWAP))
+	s = append(s, midLevels(sparse, depth, 0)...)
+	return append(s, midCheckPrev(sparse)...)
+}
+
+// midEvictE0Sc is E_0 in the 41-byte form a parent hashes: the empty leaf
+// hash followed by enc64(0).
+var midEvictE0Sc = append(append([]byte{}, midEmptyLeafHash...), midEnc0...)
+
+// midEvictPay is the MID payout check of the EVICT_SUBTREE leaf step:
+// [leaf(10) idx] -> [leaf(10)], output idx pays exactly leaf.amount to
+// P2TR(leaf.exit_key).
+func midEvictPay() []Token {
+	return []Token{
+		Num(SelOutSingle), Op(OP_TX),
+		Data(midP2TRPrefix), Num(11), Op(txscript.OP_PICK),
+		Op(txscript.OP_CAT), Op(txscript.OP_EQUALVERIFY),
+		Num(10), Op(txscript.OP_PICK), Op(txscript.OP_EQUALVERIFY),
+	}
+}
+
+// midEvictLeafStep is one position of the EVICT_SUBTREE pre-pass:
+// [.. slot idx] | .. -> [.. idx'] | .. s sc. A present slot is leaf(10)
+// ea_num ze we 0x01, an empty one a single empty element. pay is the
+// payout check, [leaf(10) idx] -> [leaf(10)].
+func midEvictLeafStep(operatorKey [32]byte, pay []Token) []Token {
+	s := []Token{
+		Op(txscript.OP_SWAP), Op(txscript.OP_IF),
+		Op(txscript.OP_TOALTSTACK),
+		Num(2), Op(txscript.OP_PICK), Op(txscript.OP_CHECKLOCKTIMEVERIFY),
+		Op(txscript.OP_DROP),
+	}
+	s = append(s, midPadz()...)
+	s = append(s, []Token{
+		Num(6), Op(txscript.OP_PICK), Op(txscript.OP_EQUALVERIFY),
+		Num(6), Op(txscript.OP_PICK), Data(operatorKey[:]),
+		Op(txscript.OP_EQUALVERIFY),
+		Op(txscript.OP_FROMALTSTACK), Op(txscript.OP_DUP),
+		Op(txscript.OP_1ADD), Op(txscript.OP_TOALTSTACK),
+	}...)
+	s = append(s, pay...)
+	s = append(s, []Token{
+		Num(9), Op(txscript.OP_PICK), Data([]byte{0x01}),
+		Op(txscript.OP_CAT), Op(txscript.OP_TOALTSTACK),
+	}...)
+	s = append(s, midLeafJoin()...)
+	s = append(s, midTagged(midLeafPrefix)...)
+	return append(s, []Token{
+		Op(txscript.OP_FROMALTSTACK), Op(txscript.OP_FROMALTSTACK),
+		Op(txscript.OP_ROT), Op(txscript.OP_SWAP), Op(txscript.OP_CAT),
+		Op(txscript.OP_FROMALTSTACK),
+		Op(txscript.OP_ROT), Op(txscript.OP_TOALTSTACK),
+		Op(txscript.OP_SWAP), Op(txscript.OP_TOALTSTACK),
+		Op(txscript.OP_ELSE),
+		Op(txscript.OP_0), Op(txscript.OP_TOALTSTACK),
+		Data(midEvictE0Sc), Op(txscript.OP_TOALTSTACK),
+		Op(txscript.OP_ENDIF),
+	}...)
+}
+
+// midEvictHashStep combines two nodes of the EVICT_SUBTREE hash pass:
+// [T .. Rsc Rs Lsc Ls] -> [T .. psc ps], or [T .. ph ps] at the subtree
+// root. t is the number of elements above T on entry; a non-root step
+// takes its pad pair from directly below T.
+func midEvictHashStep(t int64, root bool) []Token {
+	s := []Token{
+		Num(2), Op(txscript.OP_ROLL), Op(txscript.OP_ADD),
+		Op(txscript.OP_TOALTSTACK),
+		Op(txscript.OP_SWAP), Op(txscript.OP_CAT),
+		Num(t - 3), Op(txscript.OP_PICK), Op(txscript.OP_SWAP),
+		Op(txscript.OP_CAT), Op(txscript.OP_SHA256),
+		Op(txscript.OP_FROMALTSTACK),
+	}
+	if root {
+		return s
+	}
+	s = append(s, Op(txscript.OP_DUP))
+	s = append(s, midRoll(t+1, 2)...)
+	s = append(s, midEnc64()...)
+	return append(s, Op(txscript.OP_ROT), Op(txscript.OP_SWAP),
+		Op(txscript.OP_CAT), Op(txscript.OP_SWAP))
+}
+
+// MidEvictSubtreeScript is the MID-tier EVICT_SUBTREE_h script (spec 7.7,
+// dense): the FULL post-order fold with the leaf steps hoisted into a
+// pre-pass in position order, the nodes parked on the altstack as
+// (hash || enc64(sum), sum) pairs, and a mirrored post-order hash pass.
+// Like FULL's it stays out of MidAllScripts.
+func MidEvictSubtreeScript(depth, height int, operatorKey [32]byte) []Token {
+	s := midPrologue()
+	s = append(s, Data(operatorKey[:]), Op(txscript.OP_CHECKSIGVERIFY))
+	s = append(s, midEvictBody(height, operatorKey, midEvictPay())...)
+	s = append(s, midLevels(false, depth, height)...)
+	s = append(s, midCheckOld(false)...)
+	return append(s, midFinal(depth)...)
+}
+
+// midEvictBody is the middle of EVICT_SUBTREE_h after the operator's
+// signature, [.. slots] -> [T oh os E_h 0], shared with the CCV tier's
+// 0xC0 numerics, which pass their own payout check.
+func midEvictBody(height int, operatorKey [32]byte, pay []Token) []Token {
+	s := []Token{Op(txscript.OP_1)}
+	for i := 0; i < 1<<height; i++ {
+		s = append(s, midEvictLeafStep(operatorKey, pay)...)
+	}
+	s = append(s, Op(txscript.OP_DROP), Data(midNodePrefix))
+	var t int64
+	var gen func(k int, root bool)
+	gen = func(k int, root bool) {
+		if k == 0 {
+			s = append(s, Op(txscript.OP_FROMALTSTACK),
+				Op(txscript.OP_FROMALTSTACK))
+			t += 2
+			return
+		}
+		gen(k-1, false)
+		gen(k-1, false)
+		s = append(s, midEvictHashStep(t, root)...)
+		t -= 2
+	}
+	gen(height, true)
+	return append(s, Data(midEmptyNodeHash(height)), Op(txscript.OP_0))
+}
+
+// ---------------------------------------------------------------------------
+// Cohort rewrite: REWRITE_h (dense profile, spec 7.9, 8.9) under MID
+// numerics, a port of tools/layertree_mid.py's rewrite_script. Built like
+// the MID sweep: a pre-pass at the top of the stack reduces every position
+// in order and parks (ns, nsc, os, osc) on the altstack, then a hash pass
+// folds the parked nodes in mirrored post-order with two HASH_STEPs per
+// internal node. Each slot (a MID leaf of ten elements plus a presence
+// flag, or one empty element) is reduced to a canonical form built from
+// its fields before they are re-joined: the old slot to [amt8 rest ek ok
+// fin amt], the new to [amt8 rest amt]. The TAG_LEAF prefix and E_0's
+// node travel with the output index as [idx L Z] on top of the remaining
+// witness and are parked while a position's slots are reduced.
+// ---------------------------------------------------------------------------
+
+// MidSeqFinal is SEQ_FINAL under 0xC0 numerics (spec 4.5, 5.2): the
+// largest four-byte CScriptNum, whose successor does not fit the PADZ
+// gadget, so a leaf carrying it can be neither carved nor topped up
+// without its owner.
+const MidSeqFinal uint32 = 0x7FFFFFFF
+
+// midSeqFinal is the MID tier's SEQ_FINAL marker as the scripts compare it,
+// le32(MidSeqFinal).
+var midSeqFinal = tree.Le32(MidSeqFinal)
+
+// midRewriteSame is the MID "unchanged" marker (spec 7.9): a new slot of one
+// element 0x02 (0x01 being a slot's presence flag) stands for the old slot.
+var midRewriteSame = []byte{0x02}
+
+// midRewriteAmount is the MID amount-only flag (spec 7.9, 8.9): a new slot
+// amt_num za wa 0x03 stands for the old leaf with its amount replaced.
+var midRewriteAmount = []byte{0x03}
+
+// midExpandAmount is [amt_num za wa flag X(m)] -> [amt8 rest amt X(m)]: the
+// amount-only new slot expanded to the canonical form of a full new slot,
+// below the old slot's canonical block X (m items, rest_o restDepth deep
+// from the top of X). rest_o must be non-empty, which an empty old slot's
+// zeros are not (tools/layertree_mid.py _expand_amount).
+func midExpandAmount(m, restDepth int64) []Token {
+	s := []Token{Num(m), Op(txscript.OP_ROLL), Op(txscript.OP_DROP)}
+	s = append(s, midRoll(m+2, 3)...)
+	s = append(s, Num(2), Op(txscript.OP_PICK))
+	s = append(s, midNonneg()...)
+	s = append(s, Op(txscript.OP_TOALTSTACK))
+	s = append(s, midLe64()...)
+	s = append(s, Num(restDepth+1), Op(txscript.OP_PICK), Op(txscript.OP_SIZE),
+		Op(txscript.OP_0NOTEQUAL), Op(txscript.OP_VERIFY), Op(txscript.OP_FROMALTSTACK))
+	return append(s, midRoll(m+2, int(m))...)
+}
+
+// midLeafJoinOld: [amt8 ek ok evk ea nonce seq amt_num za wa] -> [amt8 rest
+// ek ok fin amt]. LEAF_JOIN with the fields the rewrite rules need kept
+// beside the re-joined rest (leaf[8:]): copies of ek and ok, fin = (seq ==
+// SEQ_FINAL) and the amount as a non-negative number.
+func midLeafJoinOld() []Token {
+	return midLeafJoinOldR(nil)
+}
+
+// midLeafJoinOldR is midLeafJoinOld, and with a reclaim key (the reclaim
+// form, spec 7.9 rule 8) two more items below amt8, the raw ea field and
+// isR = (evk == RECLAIM_KEY): [ea isR amt8 rest ek ok fin amt].
+func midLeafJoinOldR(reclaimKey *[32]byte) []Token {
+	s := []Token{Num(2), Op(txscript.OP_PICK)}
+	s = append(s, midNonneg()...)
+	s = append(s, Op(txscript.OP_TOALTSTACK))
+	s = append(s, midLe64()...)
+	s = append(s, Num(7), Op(txscript.OP_PICK), Op(txscript.OP_EQUALVERIFY))
+	s = append(s, midFieldSizeChecks()...)
+	s = append(s,
+		Op(txscript.OP_DUP), Data(midSeqFinal), Op(txscript.OP_EQUAL),
+		Op(txscript.OP_TOALTSTACK),
+		Num(5), Op(txscript.OP_PICK), Num(5), Op(txscript.OP_PICK),
+		Op(txscript.OP_TOALTSTACK), Op(txscript.OP_TOALTSTACK),
+	)
+	if reclaimKey != nil {
+		s = append(s, Num(3), Op(txscript.OP_PICK), Data(reclaimKey[:]),
+			Op(txscript.OP_EQUAL), Op(txscript.OP_TOALTSTACK),
+			Num(2), Op(txscript.OP_PICK), Op(txscript.OP_TOALTSTACK))
+	}
+	s = append(s, midRepeat([]Token{Op(txscript.OP_CAT)}, 5)...)
+	if reclaimKey != nil {
+		s = append(s, Op(txscript.OP_FROMALTSTACK), Op(txscript.OP_FROMALTSTACK),
+			Op(txscript.OP_2SWAP))
+	}
+	return append(s, midRepeat([]Token{Op(txscript.OP_FROMALTSTACK)}, 4)...)
+}
+
+// midLeafJoinNew: [amt8 ek ok evk ea nonce seq amt_num za wa] -> [amt8 rest amt].
+func midLeafJoinNew() []Token {
+	s := []Token{Num(2), Op(txscript.OP_PICK)}
+	s = append(s, midNonneg()...)
+	s = append(s, Op(txscript.OP_TOALTSTACK))
+	s = append(s, midLe64()...)
+	s = append(s, Num(7), Op(txscript.OP_PICK), Op(txscript.OP_EQUALVERIFY))
+	s = append(s, midFieldSizeChecks()...)
+	s = append(s, midRepeat([]Token{Op(txscript.OP_CAT)}, 5)...)
+	return append(s, Op(txscript.OP_FROMALTSTACK))
+}
+
+// midFieldSizeChecks are LEAF_JOIN's seven field size checks over
+// [amt8 ek ok evk ea nonce seq].
+func midFieldSizeChecks() []Token {
+	var s []Token
+	for _, f := range midFieldSizes {
+		d, size := f[0], f[1]
+		if d != 0 {
+			s = append(s, Num(d), Op(txscript.OP_PICK))
+		} else {
+			s = append(s, Op(txscript.OP_DUP))
+		}
+		s = append(s, Op(txscript.OP_SIZE), Num(size),
+			Op(txscript.OP_EQUALVERIFY), Op(txscript.OP_DROP))
+	}
+	return s
+}
+
+// midRewriteOwnerAuth: [sig C_new(3) C_old(6)] -> [C_new(3) C_old(6)]; the
+// next witness element, nine deep, is a signature by old.ok, and under ^x
+// one more by old.ek. k is the number of extra C_old items (2 in the
+// reclaim form).
+func midRewriteOwnerAuth(exitConsent bool, k int64) []Token {
+	s := []Token{Num(9 + k), Op(txscript.OP_ROLL), Num(3), Op(txscript.OP_PICK),
+		Op(txscript.OP_CHECKSIGVERIFY)}
+	if exitConsent {
+		s = append(s, Num(9+k), Op(txscript.OP_ROLL), Num(4), Op(txscript.OP_PICK),
+			Op(txscript.OP_CHECKSIGVERIFY))
+	}
+	return s
+}
+
+// midRewritePay: output idx pays exactly old.amt8 to P2TR(old.ek) and idx
+// advances on the altstack (spec 7.9 rule 5).
+func midRewritePay() []Token {
+	return []Token{
+		Op(txscript.OP_FROMALTSTACK), Op(txscript.OP_DUP), Op(txscript.OP_1ADD),
+		Op(txscript.OP_TOALTSTACK),
+		Num(SelOutSingle), Op(OP_TX),
+		Data(midP2TRPrefix), Num(6), Op(txscript.OP_PICK), Op(txscript.OP_CAT),
+		Op(txscript.OP_EQUALVERIFY),
+		Num(6), Op(txscript.OP_PICK), Op(txscript.OP_EQUALVERIFY),
+	}
+}
+
+// midRewriteConv: [idx L Z amt8 rest] -> [idx L Z sc], a leaf's 41-byte node
+// H_leaf(amt8||rest) || amt8 || 01, or Z for the empty element.
+func midRewriteConv() []Token {
+	return []Token{
+		Op(txscript.OP_SIZE), Op(txscript.OP_0NOTEQUAL), Op(txscript.OP_IF),
+		Op(txscript.OP_2DUP), Op(txscript.OP_CAT),
+		Num(4), Op(txscript.OP_PICK), Op(txscript.OP_SWAP), Op(txscript.OP_CAT),
+		Op(txscript.OP_SHA256),
+		Op(txscript.OP_NIP), Op(txscript.OP_SWAP), Data([]byte{0x01}),
+		Op(txscript.OP_CAT), Op(txscript.OP_CAT),
+		Op(txscript.OP_ELSE), Op(txscript.OP_2DROP), Op(txscript.OP_DUP),
+		Op(txscript.OP_ENDIF),
+	}
+}
+
+// midRewriteStep is one position of the pre-pass:
+// [.. {xsig} {sig} new_slot old_slot idx L Z] -> [.. idx' L Z] | .. ns nsc os osc.
+// A new slot that is the one-byte marker parks the old slot's node twice;
+// otherwise the depths in the decision block, from the top, are amt_o 0,
+// fin 1, ok 2, ek 3, rest_o 4, amt8_o 5, amt_n 6, rest_n 7, amt8_n 8, the
+// next witness element 9.
+func midRewriteStep(exitConsent bool) []Token {
+	return midRewriteStepWith(exitConsent, midRewritePay())
+}
+
+// midRewriteStepWith is midRewriteStep with the exit payout check `pay` in
+// place of midRewritePay (tools/layertree_mid.py _rewrite_step's pay
+// argument); the CCV tier's 0xC0 numerics pass their own.
+func midRewriteStepWith(exitConsent bool, pay []Token) []Token {
+	return midRewriteStepR(exitConsent, pay, nil, false)
+}
+
+// midRewriteStepR is midRewriteStepWith, and with a reclaim key the reclaim
+// form's step (spec 7.9 rule 8; tools/layertree_mid.py _rewrite_step with
+// reclaim_key): C_old carries [ea isR] below its six items, the machine is
+// [idx delta key L Z] with (delta, key) the transfer record a left step
+// (even position) leaves for its right sibling, and a changed reclaimable
+// leaf takes rule 3's increase, an R3 transfer (left only) or R1. A new slot
+// that is amt_num za wa 0x03 is the amount-only slot (midExpandAmount): it
+// is expanded to the canonical form of a leaf slot before the rules run.
+func midRewriteStepR(exitConsent bool, pay []Token, reclaimKey *[32]byte,
+	right bool) []Token {
+
+	r := reclaimKey != nil
+	var k, mc int64 = 0, 3
+	if r {
+		k, mc = 2, 5
+	}
+	toAlt := []Token{Op(txscript.OP_TOALTSTACK)}
+	fromAlt := []Token{Op(txscript.OP_FROMALTSTACK)}
+	s := midRepeat(toAlt, int(mc))
+	s = append(s, Op(txscript.OP_IF))
+	s = append(s, midLeafJoinOldR(reclaimKey)...)
+	s = append(s, Op(txscript.OP_ELSE))
+	s = append(s, midRepeat([]Token{Op(txscript.OP_0)}, int(6+k))...)
+	s = append(s, Op(txscript.OP_ENDIF))
+	// The marker: new = old, so the old node is parked as both pairs.
+	s = append(s,
+		Num(6+k), Op(txscript.OP_PICK), Data(midRewriteSame), Op(txscript.OP_EQUAL),
+		Op(txscript.OP_IF),
+		Num(6+k), Op(txscript.OP_ROLL), Op(txscript.OP_DROP),
+		Op(txscript.OP_TOALTSTACK), Op(txscript.OP_2DROP), Op(txscript.OP_DROP),
+	)
+	if r {
+		s = append(s, Op(txscript.OP_2SWAP), Op(txscript.OP_2DROP))
+	}
+	s = append(s, Op(txscript.OP_FROMALTSTACK))
+	s = append(s, midRepeat(fromAlt, int(mc))...)
+	if r && right {
+		// No transfer may be pending into an unchanged leaf.
+		s = append(s, Num(3), Op(txscript.OP_PICK), Op(txscript.OP_NOT),
+			Op(txscript.OP_VERIFY))
+	}
+	s = append(s, midRoll(5+k, 2)...)
+	s = append(s, midRewriteConv()...)
+	s = append(s, midRoll(4+k, 1)...)
+	s = append(s, Op(txscript.OP_2DUP))
+	s = append(s, midRepeat(toAlt, 4)...)
+	s = append(s, Op(txscript.OP_ELSE))
+	// An amount-only slot: the old rest, a new amount.
+	s = append(s, Num(6+k), Op(txscript.OP_PICK), Data(midRewriteAmount),
+		Op(txscript.OP_EQUAL), Op(txscript.OP_IF))
+	s = append(s, midExpandAmount(6+k, 4)...)
+	s = append(s, Op(txscript.OP_ELSE))
+	s = append(s, midRepeat(toAlt, int(6+k))...)
+	s = append(s, Op(txscript.OP_IF))
+	s = append(s, midLeafJoinNew()...)
+	s = append(s, Op(txscript.OP_ELSE))
+	s = append(s, midRepeat([]Token{Op(txscript.OP_0)}, 3)...)
+	s = append(s, Op(txscript.OP_ENDIF))
+	s = append(s, midRepeat(fromAlt, int(6+k))...)
+	s = append(s, Op(txscript.OP_ENDIF))
+
+	// Rules 3 and 5 for an old leaf that is not reclaimable.
+	oldRules := []Token{
+		Num(7 + k), Op(txscript.OP_PICK), Op(txscript.OP_SIZE), Op(txscript.OP_NIP),
+		Op(txscript.OP_0NOTEQUAL), Op(txscript.OP_IF),
+		Num(4), Op(txscript.OP_PICK), Num(8 + k), Op(txscript.OP_PICK), Op(txscript.OP_EQUAL),
+		Op(txscript.OP_OVER), Num(8 + k), Op(txscript.OP_PICK),
+		Op(txscript.OP_LESSTHANOREQUAL), Op(txscript.OP_BOOLAND),
+		Num(2), Op(txscript.OP_PICK), Op(txscript.OP_NOT), Op(txscript.OP_BOOLAND),
+		Op(txscript.OP_NOTIF),
+	}
+	oldRules = append(oldRules, midRewriteOwnerAuth(exitConsent, k)...)
+	oldRules = append(oldRules, Op(txscript.OP_ENDIF), Op(txscript.OP_ELSE))
+	oldRules = append(oldRules, midRewriteOwnerAuth(exitConsent, k)...)
+	oldRules = append(oldRules, pay...)
+	oldRules = append(oldRules, Op(txscript.OP_ENDIF))
+
+	leafRules := oldRules
+	if r {
+		r1 := midRewriteR1()
+		decrease := r1
+		if !right {
+			// An R3 transfer (body unchanged, amount lowered) passes here.
+			decrease = []Token{
+				Num(4), Op(txscript.OP_PICK), Num(10), Op(txscript.OP_PICK),
+				Op(txscript.OP_EQUAL),
+				Op(txscript.OP_OVER), Num(10), Op(txscript.OP_PICK),
+				Op(txscript.OP_LESSTHANOREQUAL), Op(txscript.OP_NOT),
+				Op(txscript.OP_BOOLAND), Op(txscript.OP_NOTIF),
+			}
+			decrease = append(decrease, r1...)
+			decrease = append(decrease, Op(txscript.OP_ENDIF))
+		}
+		leafRules = []Token{
+			Num(6), Op(txscript.OP_PICK), Op(txscript.OP_IF), // old is reclaimable
+			Num(9), Op(txscript.OP_PICK), Op(txscript.OP_SIZE), Op(txscript.OP_NIP),
+			Op(txscript.OP_0NOTEQUAL), Op(txscript.OP_IF), // new is a leaf
+			Num(4), Op(txscript.OP_PICK), Num(10), Op(txscript.OP_PICK),
+			Op(txscript.OP_EQUAL),
+			Op(txscript.OP_OVER), Num(10), Op(txscript.OP_PICK),
+			Op(txscript.OP_LESSTHANOREQUAL), Op(txscript.OP_BOOLAND),
+			Num(2), Op(txscript.OP_PICK), Op(txscript.OP_NOT), Op(txscript.OP_BOOLAND),
+			Op(txscript.OP_NOTIF),
+		}
+		leafRules = append(leafRules, decrease...)
+		leafRules = append(leafRules, Op(txscript.OP_ENDIF), Op(txscript.OP_ELSE))
+		leafRules = append(leafRules, r1...) // emptied: reclaimed, no payout
+		leafRules = append(leafRules, Op(txscript.OP_ENDIF), Op(txscript.OP_ELSE))
+		leafRules = append(leafRules, oldRules...)
+		leafRules = append(leafRules, Op(txscript.OP_ENDIF))
+	}
+	s = append(s,
+		Num(4), Op(txscript.OP_PICK), Num(8+k), Op(txscript.OP_PICK), Op(txscript.OP_EQUAL),
+		Num(6), Op(txscript.OP_PICK), Num(10+k), Op(txscript.OP_PICK), Op(txscript.OP_EQUAL),
+		Op(txscript.OP_BOOLAND), Op(txscript.OP_NOTIF),
+		Num(4), Op(txscript.OP_PICK), Op(txscript.OP_SIZE), Op(txscript.OP_NIP),
+		Op(txscript.OP_0NOTEQUAL), Op(txscript.OP_IF),
+	)
+	s = append(s, leafRules...)
+	s = append(s, Op(txscript.OP_ENDIF), Op(txscript.OP_ENDIF))
+	if r {
+		// The transfer record, with [idx delta key] popped: key 0, delta
+		// 1, idx 2, amt_o 3, fin 4, ok 5, ek 6, rest_o 7, amt8_o 8, isR 9,
+		// ea 10, amt_n 11, rest_n 12, amt8_n 13.
+		s = append(s, midRepeat(fromAlt, 3)...)
+		if !right {
+			s = append(s,
+				Op(txscript.OP_2DROP),
+				Num(7), Op(txscript.OP_PICK),
+				Num(6), Op(txscript.OP_PICK), Num(12), Op(txscript.OP_PICK),
+				Op(txscript.OP_EQUAL), Op(txscript.OP_BOOLAND),
+				Num(2), Op(txscript.OP_PICK), Num(11), Op(txscript.OP_PICK),
+				Op(txscript.OP_LESSTHANOREQUAL), Op(txscript.OP_NOT), Op(txscript.OP_BOOLAND),
+				Op(txscript.OP_IF), Op(txscript.OP_OVER), Num(10), Op(txscript.OP_PICK),
+				Op(txscript.OP_SUB),
+				Num(5), Op(txscript.OP_PICK),
+				Op(txscript.OP_ELSE), Op(txscript.OP_0), Op(txscript.OP_0), Op(txscript.OP_ENDIF),
+			)
+		} else {
+			s = append(s,
+				Op(txscript.OP_OVER), Op(txscript.OP_0NOTEQUAL), Op(txscript.OP_IF),
+				Op(txscript.OP_DUP), Num(6), Op(txscript.OP_PICK), Op(txscript.OP_EQUALVERIFY),
+				Op(txscript.OP_DUP), Num(7), Op(txscript.OP_PICK), Op(txscript.OP_EQUALVERIFY),
+				Num(9), Op(txscript.OP_PICK), Op(txscript.OP_NOT), Op(txscript.OP_VERIFY),
+				Num(7), Op(txscript.OP_PICK), Num(13), Op(txscript.OP_PICK),
+				Op(txscript.OP_EQUALVERIFY),
+				Num(11), Op(txscript.OP_PICK), Num(4), Op(txscript.OP_PICK), Op(txscript.OP_SUB),
+				Num(2), Op(txscript.OP_PICK), Op(txscript.OP_NUMEQUALVERIFY),
+				Op(txscript.OP_ENDIF), Op(txscript.OP_2DROP), Op(txscript.OP_0), Op(txscript.OP_0),
+			)
+		}
+		s = append(s, midRepeat(toAlt, 3)...)
+	}
+	s = append(s, Op(txscript.OP_TOALTSTACK), Op(txscript.OP_2DROP), Op(txscript.OP_DROP))
+	if r {
+		s = append(s, Op(txscript.OP_2SWAP), Op(txscript.OP_2DROP))
+	}
+	s = append(s, Op(txscript.OP_FROMALTSTACK))
+	s = append(s, midRepeat(fromAlt, int(mc))...)
+	s = append(s, midRoll(8+k, 2)...)
+	s = append(s, midRewriteConv()...)
+	s = append(s, midRoll(7+k, 1)...)
+	s = append(s, Op(txscript.OP_TOALTSTACK), Op(txscript.OP_TOALTSTACK))
+	s = append(s, midRoll(5+k, 2)...)
+	s = append(s, midRewriteConv()...)
+	s = append(s, midRoll(4+k, 1)...)
+	s = append(s, Op(txscript.OP_TOALTSTACK), Op(txscript.OP_TOALTSTACK))
+	return append(s, Op(txscript.OP_ENDIF))
+}
+
+// midRewriteHashStep2: [T .. Rosc Ros Rnsc Rns Losc Los Lnsc Lns] ->
+// [T .. posc pos pnsc pns] (or [T .. poh pos pnh pns] at the root): the
+// sweep's hash step on the old pair, then on the new pair, with the FULL
+// tier's HASH_STEP2 shuffles. t is the number of elements above T on entry.
+func midRewriteHashStep2(t int64, root bool) []Token {
+	s := []Token{Op(txscript.OP_2SWAP)}
+	s = append(s, midRoll(7, 2)...)
+	s = append(s, Op(txscript.OP_2SWAP))
+	s = append(s, midEvictHashStep(t, root)...)
+	s = append(s, Op(txscript.OP_2SWAP))
+	s = append(s, midRoll(5, 2)...)
+	s = append(s, Op(txscript.OP_2SWAP))
+	return append(s, midEvictHashStep(t-2, root)...)
+}
+
+// MidRewriteScript is REWRITE_h (spec 7.9, dense) in the MID tier, or
+// REWRITE_h^x with exitConsent. Like FULL's it stays out of MidAllScripts.
+//
+// witness (bottom..top) = zf wf zi wi [levels h..D-1] [pad pairs, new then
+// old per internal node in reverse consumption order] block_{2^h-1} ..
+// block_0 sig_op r m; block_i = [xsig_i] [sig_i] new_slot_i old_slot_i, a
+// slot being leaf(10) 0x01 or one empty element, and new_slot_i possibly
+// the one-byte marker 0x02 for an unchanged position.
+func MidRewriteScript(depth, height int, operatorKey [32]byte,
+	exitConsent bool) []Token {
+
+	s := midPrologue()
+	s = append(s, Data(operatorKey[:]), Op(txscript.OP_CHECKSIGVERIFY))
+	s = append(s, midRewriteBody(height, exitConsent, midRewritePay())...)
+	s = append(s, midLevels(false, depth, height)...)
+	s = append(s, midCheckOld(false)...)
+	return append(s, midFinal(depth)...)
+}
+
+// midRewriteBody is the tier-independent middle of REWRITE_h after the
+// operator's signature: [.. blocks] -> [T oh os nh ns], the pre-pass over
+// every position and the mirrored post-order hash pass, with `pay` as the
+// exit payout check (tools/layertree_mid.py rewrite_body). Shared with the
+// CCV tier's 0xC0 numerics, as midEvictBody is for the sweep.
+func midRewriteBody(height int, exitConsent bool, pay []Token) []Token {
+	return midRewriteBodyR(height, exitConsent, pay, nil)
+}
+
+// midRewriteBodyR is midRewriteBody, and with a reclaim key the reclaim
+// form's body, whose machine starts with the transfer record (0, 0).
+func midRewriteBodyR(height int, exitConsent bool, pay []Token,
+	reclaimKey *[32]byte) []Token {
+
+	s := []Token{Op(txscript.OP_1)}
+	if reclaimKey != nil {
+		s = append(s, Op(txscript.OP_0), Op(txscript.OP_0))
+	}
+	s = append(s, Data(midLeafPrefix), Data(midEvictE0Sc))
+	for i := 0; i < 1<<height; i++ {
+		s = append(s, midRewriteStepR(exitConsent, pay, reclaimKey, i%2 == 1)...)
+	}
+	if reclaimKey != nil {
+		s = append(s, Op(txscript.OP_2DROP))
+	}
+	s = append(s, Op(txscript.OP_2DROP), Op(txscript.OP_DROP), Data(midNodePrefix))
+	var t int64
+	var gen func(k int, root bool)
+	gen = func(k int, root bool) {
+		if k == 0 {
+			s = append(s, midRepeat([]Token{Op(txscript.OP_FROMALTSTACK)}, 4)...)
+			t += 4
+			return
+		}
+		gen(k-1, false)
+		gen(k-1, false)
+		s = append(s, midRewriteHashStep2(t, root)...)
+		t -= 4
+	}
+	gen(height, true)
+	return s
+}
+
+// MidDetachScript is DETACH_h (spec 7.10, 8.10) in the MID tier: FULL's
+// detach under 0xC0 numerics. The subtree root R_h and its sum are the old
+// node, E_h the new one, and output 1 is the MID tree output of a depth-h
+// tree at R_h under mH, recomputed with TREE_SPK_MIN as the prologue
+// recomputes the input's. The sum arrives as a minimal number with its PADZ
+// pad, NONNEG keeps it non-negative before it enters the fold, and le64 of
+// it is compared with output 1's amount as bytes. mH is the parent's
+// option set compiled at depth h (7.10 rule 3, MidDetachedTaptreeRoot).
+//
+// witness (bottom..top) = zf wf zi wi [levels h..D-1] R_h sum_num zs ws sig r m.
+func MidDetachScript(depth, height int, operatorKey [32]byte,
+	mH [32]byte) []Token {
+
+	s := midPrologue()
+	s = append(s, Data(operatorKey[:]), Op(txscript.OP_CHECKSIGVERIFY), // R_h sum zs ws | m r
+		Num(2), Op(txscript.OP_PICK))
+	s = append(s, midNonneg()...)
+	s = append(s, Op(txscript.OP_TOALTSTACK)) // R_h sum zs ws | m r sum
+	s = append(s, midLe64()...)               // R_h le64(sum)
+	s = append(s,
+		Op(txscript.OP_OVER), Op(txscript.OP_SIZE), Num(32),
+		Op(txscript.OP_EQUALVERIFY), Op(txscript.OP_DROP), // R_h le64
+		Op(txscript.OP_OVER), Data(mH[:]))
+	s = append(s, midTreeSpkMin()...) // R_h le64 spk1 (TREE_SPK_MIN(R_h, m_h))
+	s = append(s,
+		Op(txscript.OP_1), Num(SelOutSingle), Op(OP_TX), // R_h le64 spk1 amt1 spk1'
+		Op(txscript.OP_ROT), Op(txscript.OP_EQUALVERIFY), // R_h le64 amt1
+		Op(txscript.OP_EQUALVERIFY),  // R_h (amt1 == le64(sum_h))
+		Op(txscript.OP_FROMALTSTACK), // R_h sum
+		Data(midNodePrefix), Op(txscript.OP_ROT), Op(txscript.OP_ROT),
+		Data(midEmptyNodeHash(height)), Op(txscript.OP_0), // T R_h sum E_h 0
+	)
+	s = append(s, midLevels(false, depth, height)...)
+	s = append(s, midCheckOld(false)...)
+	return append(s, midFinal(depth)...)
+}
+
+// MidTreeOptions are a MID tree's creation parameters other than its depth
+// (spec 6.2), as FullTreeOptions are for FULL: the profile, operator key,
+// tree_id, DUST_MIN, the JOIN heights, EXIT_K sizes and JOINK sizes, and
+// the variants a MID taptree may carry (7.6): the tower-delegable exit
+// EXIT_K^t (7.2 rule 7, in place of EXIT_K; MID payouts are exact
+// already), UPDATE^x (in place of UPDATE), the four CLAIM forms, SPLIT,
+// EVICT_SUBTREE_h, REWRITE_h and its ^x form, and DETACH_h. Scripts
+// compiles the set for one depth, which is what the parent's taptree is
+// built from and what a DETACH_h child MUST be built from at depth h (7.10
+// rule 3; tools/layertree_mid.py TreeOptions).
+type MidTreeOptions struct {
+	OperatorKey [32]byte
+	TreeID      [32]byte
+	Sparse      bool
+	JoinHeights []int
+	ExitKs      []int
+	JoinKs      []int
+
+	Tower          bool
+	UpdateX        bool
+	Claim          bool
+	ClaimH         bool
+	ClaimX         bool
+	ClaimHX        bool
+	Split          bool
+	EvictHeights   []int
+	RewriteHeights []int
+	RewriteX       bool
+	DetachHeights  []int
+
+	// ReclaimKey is the tree's RECLAIM_KEY (spec 6.2) or nil. When set the
+	// set carries RECLAIM_1 (7.11) and every REWRITE_h in its reclaim form
+	// (7.9 rule 8), named REWRITE_R_h and REWRITE_XR_h. ClaimM and ClaimHM
+	// add the merge claims CLAIM^m and CLAIM^hm (7.5.4, dense only).
+	ReclaimKey *[32]byte
+	ClaimM     bool
+	ClaimHM    bool
+
+	// DustMin is the tree's DUST_MIN (spec 6.2), the floor the carve
+	// scripts carry as a constant (7.5 rule 6). Zero means tree.DustMin.
+	DustMin uint64
+}
+
+// DustFloor is the DUST_MIN the tree's carve scripts enforce: DustMin, or
+// tree.DustMin when it is zero.
+func (o MidTreeOptions) DustFloor() uint64 {
+	return dustFloor(o.DustMin)
+}
+
+// MidReferenceOptions are the reference set of 6.2 at FULL's heights and
+// sizes: EXIT_1, EXIT_2, JOIN_0, JOINK_2, UPDATE and CLAIM, dense.
+func MidReferenceOptions(operatorKey, treeID [32]byte) MidTreeOptions {
+	return MidTreeOptions{
+		OperatorKey: operatorKey, TreeID: treeID,
+		JoinHeights: []int{0}, ExitKs: []int{1, 2}, JoinKs: []int{2},
+		Claim: true,
+	}
+}
+
+// Scripts compiles the option set for a tree of the given depth, in the
+// order tools/layertree_mid.py TreeOptions.at_depth emits it: the
+// reference members first (EXIT_K, JOIN_h, JOINK_K, UPDATE or UPDATE_X,
+// the CLAIM forms, SPLIT), then the dense cohort scripts. Heights that do
+// not fit the depth are dropped, and DETACH_h embeds the same options
+// compiled at depth h.
+func (o MidTreeOptions) Scripts(depth int) []FullNamedScript {
+	var out []FullNamedScript
+	add := func(name string, toks []Token) {
+		out = append(out, FullNamedScript{Name: name, Tokens: toks})
+	}
+	for _, k := range o.ExitKs {
+		add(fmt.Sprintf("EXIT_%d", k), midExitScript(depth, k, o.Sparse, o.Tower, o.TreeID))
+	}
+	heights := o.JoinHeights
+	if o.Sparse {
+		heights = []int{0}
+	}
+	for _, h := range heights {
+		if h <= depth {
+			add(fmt.Sprintf("JOIN_%d", h), MidJoinScript(depth, h, o.OperatorKey, o.Sparse, 1))
+		}
+	}
+	for _, k := range o.JoinKs {
+		add(fmt.Sprintf("JOINK_%d", k), MidJoinScript(depth, 0, o.OperatorKey, o.Sparse, k))
+	}
+	if o.UpdateX {
+		add("UPDATE_X", MidUpdateXScript(depth, o.OperatorKey, o.Sparse))
+	} else {
+		add("UPDATE", MidUpdateScript(depth, o.OperatorKey, o.Sparse))
+	}
+	if o.Claim {
+		add("CLAIM", MidClaimScript(depth, o.TreeID, o.Sparse, o.DustMin))
+	}
+	if o.ClaimH {
+		add("CLAIM_H", MidClaimHScript(depth, o.TreeID, o.Sparse, o.DustMin))
+	}
+	if o.ClaimX {
+		add("CLAIM_X", MidClaimXScript(depth, o.TreeID, o.Sparse, o.DustMin))
+	}
+	if o.ClaimHX {
+		add("CLAIM_HX", MidClaimHXScript(depth, o.TreeID, o.Sparse, o.DustMin))
+	}
+	if o.Split {
+		add("SPLIT", MidSplitScript(depth, o.Sparse, o.DustMin))
+	}
+	if o.ReclaimKey != nil {
+		add("RECLAIM_1", MidReclaimScript(depth, *o.ReclaimKey, o.Sparse))
+	}
+	if o.Sparse {
+		return out
+	}
+	if o.ClaimM {
+		add("CLAIM_M", MidMergeScript(depth, o.TreeID, false, o.ReclaimKey, o.DustMin))
+	}
+	if o.ClaimHM {
+		add("CLAIM_HM", MidMergeScript(depth, o.TreeID, true, o.ReclaimKey, o.DustMin))
+	}
+	for _, h := range o.EvictHeights {
+		if h <= depth {
+			add(fmt.Sprintf("EVICT_SUBTREE_%d", h), MidEvictSubtreeScript(depth, h, o.OperatorKey))
+		}
+	}
+	for _, h := range o.RewriteHeights {
+		switch {
+		case h > depth:
+		case o.ReclaimKey != nil:
+			rk := *o.ReclaimKey
+			add(fmt.Sprintf("REWRITE_R_%d", h), MidRewriteRScript(depth, h, o.OperatorKey, false, rk))
+			if o.RewriteX {
+				add(fmt.Sprintf("REWRITE_XR_%d", h), MidRewriteRScript(depth, h, o.OperatorKey, true, rk))
+			}
+		default:
+			add(fmt.Sprintf("REWRITE_%d", h), MidRewriteScript(depth, h, o.OperatorKey, false))
+			if o.RewriteX {
+				add(fmt.Sprintf("REWRITE_X_%d", h), MidRewriteScript(depth, h, o.OperatorKey, true))
+			}
+		}
+	}
+	for _, h := range o.DetachHeights {
+		if h < depth {
+			add(fmt.Sprintf("DETACH_%d", h), MidDetachScript(depth, h, o.OperatorKey, o.TapTreeRoot(h)))
+		}
+	}
+	return out
+}
+
+// TapTreeRoot is the tree identifier m of a MID tree of the given depth
+// created with these options (spec 6.2); for a DETACH_h child it is m_h.
+func (o MidTreeOptions) TapTreeRoot(depth int) [32]byte {
+	scripts := o.Scripts(depth)
+	leaves := make([][32]byte, 0, len(scripts))
+	for _, s := range scripts {
+		leaves = append(leaves, TapLeafHash(MustAssemble(s.Tokens, ModeC0), 0xc0))
+	}
+	return TapTreeRoot(leaves)
+}
+
+// MidDetachedTaptreeRoot is m_h for DETACH_h under MID (spec 7.10 rule 3):
+// the parent's option set compiled for depth h with the same operator key
+// and tree_id. For the reference set of 6.2 pass MidReferenceOptions
+// (tools/layertree_mid.py detached_taptree_root).
+func MidDetachedTaptreeRoot(height int, opts MidTreeOptions) [32]byte {
+	return opts.TapTreeRoot(height)
+}
+
+// MidAllScripts builds the MID-tier script set for one profile, keyed as
+// layertree_mid.all_scripts keys them. treeID is the tree's voucher
+// binding (spec 6.2), which CLAIM carries as a constant, and dustMin its
+// DUST_MIN (zero meaning tree.DustMin).
+func MidAllScripts(depth int, operatorKey, treeID [32]byte, sparse bool,
+	joinHeights, exitKs, joinKs []int, dustMin uint64) map[string][]Token {
+
+	out := make(map[string][]Token)
+	for _, k := range exitKs {
+		out[fmt.Sprintf("EXIT_%d", k)] = MidExitScript(depth, k, sparse)
+	}
+	heights := joinHeights
+	if sparse {
+		heights = []int{0}
+	}
+	for _, h := range heights {
+		out[fmt.Sprintf("JOIN_%d", h)] = MidJoinScript(depth, h, operatorKey, sparse, 1)
+	}
+	for _, k := range joinKs {
+		out[fmt.Sprintf("JOINK_%d", k)] = MidJoinScript(depth, 0, operatorKey, sparse, k)
+	}
+	out["UPDATE"] = MidUpdateScript(depth, operatorKey, sparse)
+	out["CLAIM"] = MidClaimScript(depth, treeID, sparse, dustMin)
+	return out
+}
+
+// --------------------------------------------------------- witness helpers --
+
+// MidScriptNum is the CScriptNum minimal encoding for 0 <= n < 2^31.
+func MidScriptNum(n uint64) []byte {
+	if n > MidMaxSum {
+		panic("script: MID sum out of range")
+	}
+	if n == 0 {
+		return []byte{}
+	}
+	var b []byte
+	for v := n; v > 0; v >>= 8 {
+		b = append(b, byte(v))
+	}
+	if b[len(b)-1]&0x80 != 0 {
+		b = append(b, 0)
+	}
+	return b
+}
+
+// MidPad returns (z, w) with MidScriptNum(n)||z == le32(n) and z||w four
+// zero bytes, the pair the PADZ gadget consumes.
+func MidPad(n uint64) (z, w []byte) {
+	k := 4 - len(MidScriptNum(n))
+	return make([]byte, k), make([]byte, 4-k)
+}
+
+// MidLeafWitness is the ten-element witness encoding of a leaf.
+func MidLeafWitness(l *tree.Leaf) [][]byte {
+	b := l.Serialize()
+	z, w := MidPad(l.Amount)
+	return [][]byte{
+		b[0:8], b[8:40], b[40:72], b[72:104], b[104:108], b[108:112],
+		b[112:116], MidScriptNum(l.Amount), z, w,
+	}
+}
+
+// MidLeafExitWitness adds the minimal evict_after and its pad.
+func MidLeafExitWitness(l *tree.Leaf) [][]byte {
+	z, w := MidPad(uint64(l.EvictAfter))
+	return append(MidLeafWitness(l),
+		MidScriptNum(uint64(l.EvictAfter)), z, w)
+}
+
+// MidLevelsWitness returns the witness items for every proof level,
+// bottom..top (level D-1 first), sized against the running accumulators.
+func MidLevelsWitness(path []tree.PathStep, oldNode, newNode tree.Node,
+	sparse bool, height int) [][]byte {
+
+	perLevel := make([][][]byte, 0, len(path))
+	oldSum, newSum := oldNode.Sum, newNode.Sum
+	for k, step := range path {
+		sib := step.Sibling
+		sh := append([]byte{}, sib.Hash[:]...)
+		if sparse && sib == tree.EmptyNode(height+k) {
+			sh = []byte{}
+		}
+		zs, ws := MidPad(sib.Sum)
+		zn, wn := MidPad(newSum)
+		zo, wo := MidPad(oldSum)
+		dir := []byte{}
+		if step.Dir {
+			dir = []byte{1}
+		}
+		perLevel = append(perLevel, [][]byte{
+			zo, wo, zn, wn, dir, sh, MidScriptNum(sib.Sum), zs, ws,
+		})
+		oldSum += sib.Sum
+		newSum += sib.Sum
+	}
+	var items [][]byte
+	for i := len(perLevel) - 1; i >= 0; i-- {
+		items = append(items, perLevel[i]...)
+	}
+	return items
+}
+
+// MidPosWitness returns the sparse position items ok, nonce, pos_lo, pos_hi.
+func MidPosWitness(l *tree.Leaf) [][]byte {
+	h := l.PosHash()
+	var nonce [4]byte
+	binary.LittleEndian.PutUint32(nonce[:], l.Nonce)
+	return [][]byte{
+		append([]byte{}, l.OwnerKey[:]...), nonce[:],
+		append([]byte{}, h[0:4]...), append([]byte{}, h[4:]...),
+	}
+}

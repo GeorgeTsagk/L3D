@@ -1,0 +1,8 @@
+/.deps/
+/bin/
+/runs/
+/data/
+/logs/
+/btcd.conf
+/l3d.json
+*.lock
